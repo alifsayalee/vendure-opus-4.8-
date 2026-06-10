@@ -2,17 +2,27 @@ import { Inject, Injectable } from '@nestjs/common';
 import { Logger } from '@vendure/core';
 import {
     ApiError,
+    ApplicationContextUserAction,
+    BillingPlan,
     CapturedPayment,
+    CaptureType,
     CheckoutPaymentIntent,
     Client,
     CustomError,
     Environment,
+    IntervalUnit,
     LogLevel,
     Order as PayPalOrder,
     OrderAuthorizeResponse,
     OrdersController,
+    PatchOp,
     PaymentsController,
+    PlanRequestStatus,
     Refund,
+    SetupFeeFailureAction,
+    Subscription as PayPalSubscriptionResponse,
+    SubscriptionsController,
+    TenureType,
 } from '@paypal/paypal-server-sdk';
 
 import { loggerCtx, PAYPAL_PLUGIN_OPTIONS } from './constants';
@@ -26,6 +36,13 @@ import {
     RefundCaptureResult,
     VoidAuthorizationResult,
 } from './types';
+import {
+    CreateBillingPlanInput,
+    CreateBillingPlanResult,
+    CreateSubscriptionResult,
+    GetSubscriptionResult,
+    PayPalIntervalUnit,
+} from './subscription/subscription-types';
 
 /**
  * @description
@@ -40,6 +57,7 @@ import {
 export class PayPalService {
     private readonly ordersController: OrdersController;
     private readonly paymentsController: PaymentsController;
+    private readonly subscriptionsController: SubscriptionsController;
 
     constructor(@Inject(PAYPAL_PLUGIN_OPTIONS) private readonly options: PayPalPluginOptions) {
         const client = new Client({
@@ -59,6 +77,7 @@ export class PayPalService {
         });
         this.ordersController = new OrdersController(client);
         this.paymentsController = new PaymentsController(client);
+        this.subscriptionsController = new SubscriptionsController(client);
     }
 
     /**
@@ -444,6 +463,297 @@ export class PayPalService {
         return { captureId: authorizationId, captureStatus: 'COMPLETED' };
     }
 
+    // ---------------------------------------------------------------------------
+    // Subscriptions (Use Case 6)
+    // ---------------------------------------------------------------------------
+
+    /**
+     * @description
+     * Creates a billing plan (recurring price + interval) against an existing
+     * PayPal Catalog Product. The product must be created beforehand (the SDK
+     * does not expose product creation).
+     */
+    async createBillingPlan(
+        input: CreateBillingPlanInput,
+        idempotencyKey: string,
+    ): Promise<CreateBillingPlanResult> {
+        let result: BillingPlan;
+        try {
+            result = await this.withRetry(
+                'create the billing plan',
+                async () =>
+                    (
+                        await this.subscriptionsController.createBillingPlan({
+                            prefer: 'return=representation',
+                            paypalRequestId: idempotencyKey,
+                            body: {
+                                productId: input.productId,
+                                name: input.name,
+                                description: input.description,
+                                status: input.activateImmediately
+                                    ? PlanRequestStatus.Active
+                                    : PlanRequestStatus.Created,
+                                billingCycles: [
+                                    {
+                                        frequency: {
+                                            intervalUnit: this.toIntervalUnit(input.intervalUnit),
+                                            intervalCount: input.intervalCount,
+                                        },
+                                        tenureType: TenureType.Regular,
+                                        sequence: 1,
+                                        totalCycles: input.totalCycles ?? 0,
+                                        pricingScheme: {
+                                            fixedPrice: {
+                                                currencyCode: input.currencyCode,
+                                                value: this.toPayPalValue(
+                                                    input.amountMinorUnits,
+                                                    input.currencyCode,
+                                                ),
+                                            },
+                                        },
+                                    },
+                                ],
+                                paymentPreferences: {
+                                    autoBillOutstanding: true,
+                                    setupFeeFailureAction: SetupFeeFailureAction.Continue,
+                                    paymentFailureThreshold: input.paymentFailureThreshold ?? 0,
+                                },
+                                quantitySupported: false,
+                            },
+                        })
+                    ).result,
+            );
+        } catch (e) {
+            throw this.toError('create the billing plan', e);
+        }
+        if (!result?.id) {
+            throw new Error('PayPal did not return a billing plan id');
+        }
+        return { planId: result.id, status: result.status ?? 'CREATED' };
+    }
+
+    /** Activates a billing plan, making it available for new subscriptions. */
+    async activateBillingPlan(planId: string): Promise<void> {
+        try {
+            await this.withRetry('activate the billing plan', async () => {
+                await this.subscriptionsController.activateBillingPlan(planId);
+            });
+        } catch (e) {
+            throw this.toError('activate the billing plan', e);
+        }
+    }
+
+    /** Deactivates a billing plan so it can no longer accept new subscriptions. */
+    async deactivateBillingPlan(planId: string): Promise<void> {
+        try {
+            await this.withRetry('deactivate the billing plan', async () => {
+                await this.subscriptionsController.deactivateBillingPlan(planId);
+            });
+        } catch (e) {
+            throw this.toError('deactivate the billing plan', e);
+        }
+    }
+
+    /** Updates the recurring price of a billing plan's regular billing cycle. */
+    async updatePlanPricing(
+        planId: string,
+        amountMinorUnits: number,
+        currencyCode: string,
+        billingCycleSequence = 1,
+    ): Promise<void> {
+        try {
+            await this.withRetry('update the billing plan pricing', async () => {
+                await this.subscriptionsController.updateBillingPlanPricingSchemes({
+                    id: planId,
+                    body: {
+                        pricingSchemes: [
+                            {
+                                billingCycleSequence,
+                                pricingScheme: {
+                                    fixedPrice: {
+                                        currencyCode,
+                                        value: this.toPayPalValue(amountMinorUnits, currencyCode),
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                });
+            });
+        } catch (e) {
+            throw this.toError('update the billing plan pricing', e);
+        }
+    }
+
+    /** Updates the consecutive-payment-failure threshold of a billing plan. */
+    async updatePlanPaymentFailureThreshold(planId: string, threshold: number): Promise<void> {
+        try {
+            await this.withRetry('update the billing plan failure threshold', async () => {
+                await this.subscriptionsController.patchBillingPlan({
+                    id: planId,
+                    body: [
+                        {
+                            op: PatchOp.Replace,
+                            path: '/payment_preferences/payment_failure_threshold',
+                            value: threshold,
+                        },
+                    ],
+                });
+            });
+        } catch (e) {
+            throw this.toError('update the billing plan failure threshold', e);
+        }
+    }
+
+    /**
+     * @description
+     * Creates a subscription against a billing plan and returns the buyer
+     * approval URL to which the storefront must redirect the customer.
+     */
+    async createSubscription(
+        input: { planId: string; brandName?: string },
+        idempotencyKey: string,
+    ): Promise<CreateSubscriptionResult> {
+        let response: SubscriptionApiResponse;
+        try {
+            response = await this.withRetry('create the subscription', async () =>
+                this.subscriptionsController.createSubscription({
+                    prefer: 'return=representation',
+                    // Idempotency key: prevents a retried call from creating
+                    // two subscriptions for the same buyer action.
+                    paypalRequestId: idempotencyKey,
+                    body: {
+                        planId: input.planId,
+                        applicationContext: {
+                            ...(input.brandName ? { brandName: input.brandName } : {}),
+                            returnUrl: this.options.returnUrl,
+                            cancelUrl: this.options.cancelUrl,
+                            userAction: ApplicationContextUserAction.SubscribeNow,
+                        },
+                    },
+                }),
+            );
+        } catch (e) {
+            throw this.toError('create the subscription', e);
+        }
+        const result = response.result;
+        if (!result?.id) {
+            throw new Error('PayPal did not return a subscription id');
+        }
+        return {
+            subscriptionId: result.id,
+            status: readSubscriptionStatus(response) ?? 'APPROVAL_PENDING',
+            planId: result.planId,
+            approvalUrl: result.links?.find(l => l.rel === 'approve')?.href,
+        };
+    }
+
+    /** Reads a subscription's current status from PayPal. */
+    async getSubscription(subscriptionId: string): Promise<GetSubscriptionResult> {
+        let response: SubscriptionApiResponse;
+        try {
+            response = await this.withRetry('get the subscription', async () =>
+                this.subscriptionsController.getSubscription({ id: subscriptionId }),
+            );
+        } catch (e) {
+            throw this.toError('get the subscription', e);
+        }
+        const result = response.result;
+        if (!result?.id) {
+            throw new Error('PayPal subscription not found');
+        }
+        return {
+            subscriptionId: result.id,
+            status: readSubscriptionStatus(response) ?? 'UNKNOWN',
+            planId: result.planId,
+        };
+    }
+
+    /** Reactivates a suspended subscription. */
+    async activateSubscription(subscriptionId: string, reason?: string): Promise<void> {
+        try {
+            await this.withRetry('activate the subscription', async () => {
+                await this.subscriptionsController.activateSubscription({
+                    id: subscriptionId,
+                    body: reason ? { reason } : undefined,
+                });
+            });
+        } catch (e) {
+            throw this.toError('activate the subscription', e);
+        }
+    }
+
+    /** Suspends an active subscription (pausing future charges). */
+    async suspendSubscription(subscriptionId: string, reason?: string): Promise<void> {
+        try {
+            await this.withRetry('suspend the subscription', async () => {
+                await this.subscriptionsController.suspendSubscription({
+                    id: subscriptionId,
+                    body: reason ? { reason } : undefined,
+                });
+            });
+        } catch (e) {
+            throw this.toError('suspend the subscription', e);
+        }
+    }
+
+    /** Cancels a subscription. */
+    async cancelSubscription(subscriptionId: string, reason?: string): Promise<void> {
+        try {
+            await this.withRetry('cancel the subscription', async () => {
+                await this.subscriptionsController.cancelSubscription({
+                    id: subscriptionId,
+                    body: reason ? { reason } : undefined,
+                });
+            });
+        } catch (e) {
+            throw this.toError('cancel the subscription', e);
+        }
+    }
+
+    /**
+     * @description
+     * Charges the subscriber for the outstanding balance — used to retry a
+     * failed subscription payment.
+     */
+    async captureSubscriptionPayment(
+        subscriptionId: string,
+        amountMinorUnits: number,
+        currencyCode: string,
+        note: string,
+    ): Promise<void> {
+        try {
+            await this.withRetry('capture the subscription payment', async () => {
+                await this.subscriptionsController.captureSubscription({
+                    id: subscriptionId,
+                    body: {
+                        note,
+                        captureType: CaptureType.OutstandingBalance,
+                        amount: {
+                            currencyCode,
+                            value: this.toPayPalValue(amountMinorUnits, currencyCode),
+                        },
+                    },
+                });
+            });
+        } catch (e) {
+            throw this.toError('capture the subscription payment', e);
+        }
+    }
+
+    private toIntervalUnit(unit: PayPalIntervalUnit): IntervalUnit {
+        switch (unit) {
+            case 'WEEK':
+                return IntervalUnit.Week;
+            case 'MONTH':
+                return IntervalUnit.Month;
+            case 'YEAR':
+                return IntervalUnit.Year;
+            default:
+                return IntervalUnit.Day;
+        }
+    }
+
     /**
      * Converts an integer amount in minor units into the decimal string format
      * expected by PayPal, honouring the number of fraction digits defined for
@@ -571,5 +881,38 @@ function safeStringify(value: unknown): string {
         return JSON.stringify(value);
     } catch {
         return String(value);
+    }
+}
+
+/** The ApiResponse shape returned by the subscription get/create SDK calls. */
+type SubscriptionApiResponse = Awaited<
+    ReturnType<SubscriptionsController['getSubscription']>
+>;
+
+/**
+ * The SDK's `Subscription` model does not declare the `status` field even
+ * though PayPal returns it, so the typed `result` strips it. We therefore read
+ * `status` from the raw JSON response body, falling back to the typed result.
+ */
+function readSubscriptionStatus(response: {
+    result?: PayPalSubscriptionResponse;
+    body?: unknown;
+}): string | undefined {
+    const fromBody = parseStatusFromBody(response.body);
+    if (fromBody) {
+        return fromBody;
+    }
+    return (response.result as { status?: string } | undefined)?.status;
+}
+
+function parseStatusFromBody(body: unknown): string | undefined {
+    if (typeof body !== 'string' || body.length === 0) {
+        return undefined;
+    }
+    try {
+        const parsed = JSON.parse(body) as { status?: unknown };
+        return typeof parsed.status === 'string' ? parsed.status : undefined;
+    } catch {
+        return undefined;
     }
 }

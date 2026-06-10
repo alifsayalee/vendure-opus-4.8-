@@ -11,6 +11,7 @@ import {
     TransactionalConnection,
     VendurePlugin,
 } from '@vendure/core';
+import gql from 'graphql-tag';
 
 import { shopApiExtensions } from './api/api-extensions';
 import { PayPalShopResolver } from './api/paypal-shop.resolver';
@@ -22,6 +23,15 @@ import {
 } from './constants';
 import { payPalPaymentHandler } from './paypal-payment-handler';
 import { PayPalService } from './paypal.service';
+import { PayPalSubscriptionAdminResolver } from './subscription/api/paypal-subscription-admin.resolver';
+import { PayPalSubscriptionShopResolver } from './subscription/api/paypal-subscription-shop.resolver';
+import {
+    subscriptionAdminApiExtensions,
+    subscriptionShopApiExtensions,
+} from './subscription/api/subscription-api-extensions';
+import { PayPalSubscription } from './subscription/paypal-subscription.entity';
+import { PayPalSubscriptionService } from './subscription/paypal-subscription.service';
+import { payPalSubscriptionSyncTask } from './subscription/paypal-subscription-sync.task';
 import { PayPalIntent, PayPalPluginOptions } from './types';
 
 /**
@@ -53,16 +63,30 @@ import { PayPalIntent, PayPalPluginOptions } from './types';
  */
 @VendurePlugin({
     imports: [PluginCommonModule],
+    entities: [PayPalSubscription],
     configuration: config => {
         config.paymentOptions.paymentMethodHandlers.push(payPalPaymentHandler);
+        // Register the recurring subscription-status reconciliation task.
+        config.schedulerOptions.tasks = [
+            ...(config.schedulerOptions.tasks ?? []),
+            payPalSubscriptionSyncTask,
+        ];
         return config;
     },
     shopApiExtensions: {
-        schema: shopApiExtensions,
-        resolvers: [PayPalShopResolver],
+        schema: gql`
+            ${shopApiExtensions}
+            ${subscriptionShopApiExtensions}
+        `,
+        resolvers: [PayPalShopResolver, PayPalSubscriptionShopResolver],
+    },
+    adminApiExtensions: {
+        schema: subscriptionAdminApiExtensions,
+        resolvers: [PayPalSubscriptionAdminResolver],
     },
     providers: [
         PayPalService,
+        PayPalSubscriptionService,
         { provide: PAYPAL_PLUGIN_OPTIONS, useFactory: () => PayPalPlugin.options },
     ],
 })
