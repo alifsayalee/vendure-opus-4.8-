@@ -22,6 +22,7 @@ import {
     CreatePayPalOrderResult,
     PayPalIntent,
     PayPalPluginOptions,
+    VoidAuthorizationResult,
 } from './types';
 
 /**
@@ -291,6 +292,42 @@ export class PayPalService {
         } catch (e) {
             throw this.toError('capture the authorized PayPal payment', e);
         }
+    }
+
+    /**
+     * @description
+     * Voids (cancels) an authorized but uncaptured PayPal payment, releasing the
+     * reserved funds back to the buyer (Use Case 3). Cannot void an authorization
+     * that has already been fully captured.
+     *
+     * @param authorizationId The PayPal authorization id from {@link authorizeOrder}.
+     */
+    async voidAuthorization(authorizationId: string): Promise<VoidAuthorizationResult> {
+        let result: Awaited<ReturnType<PaymentsController['voidPayment']>>['result'];
+        try {
+            result = await this.withRetry(
+                'void the authorized PayPal payment',
+                async () =>
+                    (
+                        await this.paymentsController.voidPayment({
+                            authorizationId,
+                            prefer: 'return=representation',
+                            // Idempotency key: a retried void is a no-op rather than an error.
+                            paypalRequestId: `void-${authorizationId}`,
+                        })
+                    ).result,
+            );
+        } catch (e) {
+            throw this.toError('void the authorized PayPal payment', e);
+        }
+
+        // With `return=representation` the result is the voided authorization;
+        // with `return=minimal` (or a 204) it may be null, which still indicates
+        // a successful void.
+        return {
+            authorizationId,
+            status: result?.status ?? 'VOIDED',
+        };
     }
 
     /**
