@@ -2,10 +2,12 @@ import {
     CancelPaymentErrorResult,
     CancelPaymentResult,
     CreatePaymentResult,
+    CreateRefundResult,
     Injector,
     LanguageCode,
     Logger,
     PaymentMethodHandler,
+    RefundState,
     SettlePaymentErrorResult,
     SettlePaymentResult,
 } from '@vendure/core';
@@ -172,7 +174,64 @@ export const payPalPaymentHandler = new PaymentMethodHandler({
             return { success: false, errorMessage };
         }
     },
+
+    createRefund: async (ctx, input, amount, order, payment): Promise<CreateRefundResult> => {
+        const captureId = (payment.metadata as { captureId?: string })?.captureId;
+        if (!captureId) {
+            Logger.warn(
+                `Cannot refund payment ${payment.id} for order ${order.code}: missing captureId`,
+                loggerCtx,
+            );
+            return { state: 'Failed' as const, metadata: { errorMessage: 'Missing captureId in payment metadata' } };
+        }
+
+        // Use Case 4 handles FULL refunds only (the entire captured amount).
+        // Partial refunds (a smaller amount) are implemented in Use Case 5.
+        if (amount < payment.amount) {
+            Logger.warn(
+                `Partial refund of ${amount} requested for payment ${payment.id} (amount ${payment.amount}); ` +
+                    'partial refunds are not yet supported',
+                loggerCtx,
+            );
+            return {
+                state: 'Failed' as const,
+                metadata: { errorMessage: 'Partial refunds are not yet supported' },
+            };
+        }
+
+        try {
+            const refund = await payPalService.refundCapture(captureId);
+            Logger.info(
+                `Refunded PayPal capture ${captureId} for order ${order.code} (refund ${refund.refundId}, status ${refund.status})`,
+                loggerCtx,
+            );
+            return {
+                state: mapRefundState(refund.status),
+                transactionId: refund.refundId,
+                metadata: {
+                    refundId: refund.refundId,
+                    refundStatus: refund.status,
+                    currencyCode: refund.currencyCode,
+                    value: refund.value,
+                },
+            };
+        } catch (e) {
+            const errorMessage = e instanceof Error ? e.message : String(e);
+            return { state: 'Failed' as const, metadata: { errorMessage } };
+        }
+    },
 });
+
+/** Maps a PayPal refund status to the corresponding Vendure {@link RefundState}. */
+function mapRefundState(status: string): RefundState {
+    if (status === 'COMPLETED') {
+        return 'Settled';
+    }
+    if (status === 'PENDING') {
+        return 'Pending';
+    }
+    return 'Failed';
+}
 
 async function capture(
     orderCode: string,
