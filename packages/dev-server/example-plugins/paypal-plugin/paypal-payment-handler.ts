@@ -1,4 +1,6 @@
 import {
+    CancelPaymentErrorResult,
+    CancelPaymentResult,
     CreatePaymentResult,
     Injector,
     LanguageCode,
@@ -132,6 +134,41 @@ export const payPalPaymentHandler = new PaymentMethodHandler({
             };
         } catch (e) {
             const errorMessage = e instanceof Error ? e.message : String(e);
+            return { success: false, errorMessage };
+        }
+    },
+
+    cancelPayment: async (
+        ctx,
+        order,
+        payment,
+        args,
+    ): Promise<CancelPaymentResult | CancelPaymentErrorResult> => {
+        const authorizationId = (payment.metadata as { authorizationId?: string })?.authorizationId;
+
+        // Only the authorize flow holds reservable funds at PayPal. For an
+        // immediate-capture payment there is no authorization to void (a captured
+        // payment must be refunded, not voided), so there is nothing to do here.
+        if (!authorizationId) {
+            return { success: true };
+        }
+
+        try {
+            const result = await payPalService.voidAuthorization(authorizationId);
+            Logger.info(
+                `Voided PayPal authorization ${authorizationId} for order ${order.code} (status ${result.status})`,
+                loggerCtx,
+            );
+            return {
+                success: true,
+                metadata: { voided: true, authorizationId, voidStatus: result.status },
+            };
+        } catch (e) {
+            const errorMessage = e instanceof Error ? e.message : String(e);
+            Logger.warn(
+                `Failed to void PayPal authorization ${authorizationId} for order ${order.code}: ${errorMessage}`,
+                loggerCtx,
+            );
             return { success: false, errorMessage };
         }
     },

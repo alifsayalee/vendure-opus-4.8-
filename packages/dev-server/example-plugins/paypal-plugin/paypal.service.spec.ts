@@ -6,6 +6,7 @@ const authorizeOrderMock = vi.fn();
 const getOrderMock = vi.fn();
 const captureAuthorizedPaymentMock = vi.fn();
 const getAuthorizedPaymentMock = vi.fn();
+const voidPaymentMock = vi.fn();
 
 // Mock the PayPal SDK: keep the real enums/error classes, but replace the
 // network-facing Client and controllers with controllable stubs.
@@ -23,6 +24,7 @@ vi.mock('@paypal/paypal-server-sdk', async importOriginal => {
         PaymentsController: class {
             captureAuthorizedPayment = captureAuthorizedPaymentMock;
             getAuthorizedPayment = getAuthorizedPaymentMock;
+            voidPayment = voidPaymentMock;
         },
     };
 });
@@ -64,6 +66,7 @@ describe('PayPalService', () => {
         getOrderMock.mockReset();
         captureAuthorizedPaymentMock.mockReset();
         getAuthorizedPaymentMock.mockReset();
+        voidPaymentMock.mockReset();
     });
 
     describe('createOrder', () => {
@@ -289,6 +292,34 @@ describe('PayPalService', () => {
             captureAuthorizedPaymentMock.mockRejectedValue(new Error('nope'));
             await expect(createService().captureAuthorization('AUTH-1')).rejects.toThrow(
                 /Failed to capture the authorized PayPal payment: nope/,
+            );
+        });
+    });
+
+    describe('voidAuthorization', () => {
+        it('voids an authorization and returns VOIDED with an idempotency key', async () => {
+            voidPaymentMock.mockResolvedValue({ result: { id: 'AUTH-1', status: 'VOIDED' } });
+
+            const result = await createService().voidAuthorization('AUTH-1');
+
+            expect(result).toEqual({ authorizationId: 'AUTH-1', status: 'VOIDED' });
+            expect(voidPaymentMock.mock.calls[0][0]).toMatchObject({
+                authorizationId: 'AUTH-1',
+                paypalRequestId: 'void-AUTH-1',
+            });
+        });
+
+        it('treats a null result (return=minimal / 204) as a successful void', async () => {
+            voidPaymentMock.mockResolvedValue({ result: null });
+
+            const result = await createService().voidAuthorization('AUTH-1');
+            expect(result).toEqual({ authorizationId: 'AUTH-1', status: 'VOIDED' });
+        });
+
+        it('wraps SDK errors (e.g. already captured) with a safe message', async () => {
+            voidPaymentMock.mockRejectedValue(new Error('already captured'));
+            await expect(createService().voidAuthorization('AUTH-1')).rejects.toThrow(
+                /Failed to void the authorized PayPal payment: already captured/,
             );
         });
     });

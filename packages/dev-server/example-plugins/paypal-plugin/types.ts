@@ -118,6 +118,18 @@ export interface CaptureAuthorizationResult {
 
 /**
  * @description
+ * The result of voiding (cancelling) an authorized but uncaptured PayPal
+ * payment (Use Case 3).
+ */
+export interface VoidAuthorizationResult {
+    /** The PayPal authorization id that was voided. */
+    authorizationId: string;
+    /** The authorization status after the void (`VOIDED` on success). */
+    status: string;
+}
+
+/**
+ * @description
  * The shape of the `metadata` passed by the storefront to the
  * `addPaymentToOrder` mutation when paying with PayPal.
  */
