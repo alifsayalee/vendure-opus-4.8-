@@ -6,3 +6,4 @@ export * from './types';
 export * from './subscription/paypal-subscription.entity';
 export * from './subscription/paypal-subscription.service';
 export * from './subscription/subscription-types';
+export * from './reporting/reporting-types';
