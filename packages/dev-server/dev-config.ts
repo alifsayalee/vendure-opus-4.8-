@@ -27,6 +27,7 @@ import { DataSourceOptions } from 'typeorm';
 import { NavModifierPlugin } from './test-plugins/nav-modifier-plugin/nav-modifier-plugin';
 // import { FieldTestPlugin } from './test-plugins/field-test/field-test-plugin';
 import { ReviewsPlugin } from './test-plugins/reviews/reviews-plugin';
+import { PayPalPlugin } from './example-plugins/paypal-plugin';
 
 const IS_INSTRUMENTED = process.env.IS_INSTRUMENTED === 'true';
 
@@ -123,6 +124,26 @@ export const devConfig: VendureConfig = {
         ReviewsPlugin,
         // FieldTestPlugin,
         NavModifierPlugin,
+        // The PayPal plugin is only enabled when sandbox/production credentials
+        // are provided via environment variables, so the dev server still boots
+        // without them.
+        ...(process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_CLIENT_SECRET
+            ? [
+                  PayPalPlugin.init({
+                      clientId: process.env.PAYPAL_CLIENT_ID,
+                      clientSecret: process.env.PAYPAL_CLIENT_SECRET,
+                      environment:
+                          process.env.PAYPAL_ENVIRONMENT === 'production' ? 'production' : 'sandbox',
+                      returnUrl:
+                          process.env.PAYPAL_RETURN_URL ||
+                          'http://localhost:4201/checkout/paypal/return',
+                      cancelUrl:
+                          process.env.PAYPAL_CANCEL_URL ||
+                          'http://localhost:4201/checkout/paypal/cancel',
+                      brandName: process.env.PAYPAL_BRAND_NAME || 'Vendure Dev Store',
+                  }),
+              ]
+            : []),
         GraphiqlPlugin.init(),
         AssetServerPlugin.init({
             route: 'assets',
