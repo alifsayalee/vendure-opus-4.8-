@@ -73,7 +73,10 @@ export async function getFinalVendureSchema(
     const { config, typePaths, typesLoader, apiType } = options;
     // Paths must be normalized to use forward-slash separators.
     // See https://github.com/nestjs/graphql/issues/336
-    const normalizedPaths = typePaths.map(p => p.split(path.sep).join('/'));
+    const normalizedPaths = typePaths.map(p => {
+        const resolvedPath = path.isAbsolute(p) ? path.relative(process.cwd(), p) : p;
+        return resolvedPath.split(path.sep).join('/');
+    });
     const typeDefs = await typesLoader.mergeTypesByPaths(normalizedPaths);
     let schema = buildSchema(typeDefs);
     schema = buildSchemaFromVendureConfig(schema, config, apiType);

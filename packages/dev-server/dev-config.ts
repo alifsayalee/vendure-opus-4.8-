@@ -240,7 +240,7 @@ function getDbConfig(): DataSourceOptions {
                 synchronize: true,
                 type: 'mariadb',
                 host: '127.0.0.1',
-                port: 3306,
+                port: Number(process.env.DB_PORT) || 3307,
                 username: 'vendure',
                 password: 'password',
                 database: 'vendure-dev',

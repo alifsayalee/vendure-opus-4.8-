@@ -1,11 +1,11 @@
 # This contains the services required to develop and test Vendure
 # locally. It includes multiple SQL databases (for testing specific
 # versions), Elasticsearch, Redis etc.
-name: vendure-monorepo
+name: vendure-opus48
 services:
     mariadb:
         image: 'mariadb:latest'
-        container_name: mariadb
+        container_name: mariadb-opus48
         environment:
             MARIADB_DATABASE: vendure-dev
             MARIADB_USER: vendure
@@ -14,7 +14,7 @@ services:
         volumes:
             - 'mariadb_data:/var/lib/mysql'
         ports:
-            - '3306:3306'
+            - '3307:3306'
     mysql_8:
         image: mysql:8.0
         container_name: mysql-8
