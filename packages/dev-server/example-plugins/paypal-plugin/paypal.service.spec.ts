@@ -2,9 +2,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const createOrderMock = vi.fn();
 const captureOrderMock = vi.fn();
+const authorizeOrderMock = vi.fn();
+const getOrderMock = vi.fn();
+const captureAuthorizedPaymentMock = vi.fn();
+const getAuthorizedPaymentMock = vi.fn();
 
 // Mock the PayPal SDK: keep the real enums/error classes, but replace the
-// network-facing Client and OrdersController with controllable stubs.
+// network-facing Client and controllers with controllable stubs.
 vi.mock('@paypal/paypal-server-sdk', async importOriginal => {
     const actual = await importOriginal<typeof import('@paypal/paypal-server-sdk')>();
     return {
@@ -13,9 +17,22 @@ vi.mock('@paypal/paypal-server-sdk', async importOriginal => {
         OrdersController: class {
             createOrder = createOrderMock;
             captureOrder = captureOrderMock;
+            authorizeOrder = authorizeOrderMock;
+            getOrder = getOrderMock;
+        },
+        PaymentsController: class {
+            captureAuthorizedPayment = captureAuthorizedPaymentMock;
+            getAuthorizedPayment = getAuthorizedPaymentMock;
         },
     };
 });
+
+/** A Node-style transient network error, as thrown on a connection timeout. */
+function transientError(message = 'connect ETIMEDOUT 151.101.143.1:443'): Error {
+    const err = new Error(message) as Error & { code?: string };
+    err.code = 'ETIMEDOUT';
+    return err;
+}
 
 // Avoid bootstrapping the full Vendure runtime just to access the logger.
 vi.mock('@vendure/core', () => ({
@@ -43,6 +60,10 @@ describe('PayPalService', () => {
     beforeEach(() => {
         createOrderMock.mockReset();
         captureOrderMock.mockReset();
+        authorizeOrderMock.mockReset();
+        getOrderMock.mockReset();
+        captureAuthorizedPaymentMock.mockReset();
+        getAuthorizedPaymentMock.mockReset();
     });
 
     describe('createOrder', () => {
@@ -103,6 +124,15 @@ describe('PayPalService', () => {
             expect(passed.body.purchaseUnits[0].amount).toEqual({ currencyCode: 'JPY', value: '1000' });
         });
 
+        it('uses AUTHORIZE intent when requested', async () => {
+            createOrderMock.mockResolvedValue({
+                result: { id: 'X', status: 'CREATED', links: [{ rel: 'approve', href: 'https://x' }] },
+            });
+
+            await createService().createOrder(1000, 'USD', 'ORDER-AUTH', 'authorize');
+            expect(createOrderMock.mock.calls[0][0].body.intent).toBe('AUTHORIZE');
+        });
+
         it('throws when PayPal returns no approval URL', async () => {
             createOrderMock.mockResolvedValue({ result: { id: 'PAYPAL-ORDER-3', status: 'CREATED', links: [] } });
             await expect(createService().createOrder(1000, 'USD', 'ORDER-3')).rejects.toThrow(
@@ -154,7 +184,10 @@ describe('PayPalService', () => {
                 currencyCode: 'USD',
                 value: '10.00',
             });
-            expect(captureOrderMock.mock.calls[0][0]).toMatchObject({ id: 'PAYPAL-ORDER-1' });
+            expect(captureOrderMock.mock.calls[0][0]).toMatchObject({
+                id: 'PAYPAL-ORDER-1',
+                paypalRequestId: 'capture-order-PAYPAL-ORDER-1',
+            });
         });
 
         it('throws when the response contains no capture', async () => {
@@ -169,6 +202,166 @@ describe('PayPalService', () => {
             await expect(createService().captureOrder('PAYPAL-ORDER-1')).rejects.toThrow(
                 /Failed to capture the PayPal order: boom/,
             );
+        });
+    });
+
+    describe('authorizeOrder', () => {
+        it('returns the authorization id and status on success', async () => {
+            authorizeOrderMock.mockResolvedValue({
+                result: {
+                    id: 'PAYPAL-ORDER-2',
+                    status: 'COMPLETED',
+                    purchaseUnits: [
+                        {
+                            payments: {
+                                authorizations: [
+                                    {
+                                        id: 'AUTH-1',
+                                        status: 'CREATED',
+                                        amount: { currencyCode: 'USD', value: '10.00' },
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                },
+            });
+
+            const result = await createService().authorizeOrder('PAYPAL-ORDER-2');
+            expect(result).toEqual({
+                paypalOrderId: 'PAYPAL-ORDER-2',
+                orderStatus: 'COMPLETED',
+                authorizationId: 'AUTH-1',
+                authorizationStatus: 'CREATED',
+                currencyCode: 'USD',
+                value: '10.00',
+            });
+            expect(authorizeOrderMock.mock.calls[0][0]).toMatchObject({
+                id: 'PAYPAL-ORDER-2',
+                paypalRequestId: 'authorize-PAYPAL-ORDER-2',
+            });
+        });
+
+        it('throws when the response contains no authorization', async () => {
+            authorizeOrderMock.mockResolvedValue({
+                result: { id: 'PAYPAL-ORDER-2', status: 'COMPLETED', purchaseUnits: [{ payments: {} }] },
+            });
+            await expect(createService().authorizeOrder('PAYPAL-ORDER-2')).rejects.toThrow(
+                /did not contain an authorization/,
+            );
+        });
+
+        it('wraps SDK errors with a safe message', async () => {
+            authorizeOrderMock.mockRejectedValue(new Error('bang'));
+            await expect(createService().authorizeOrder('PAYPAL-ORDER-2')).rejects.toThrow(
+                /Failed to authorize the PayPal order: bang/,
+            );
+        });
+    });
+
+    describe('captureAuthorization', () => {
+        it('captures an authorization with finalCapture and returns the capture id', async () => {
+            captureAuthorizedPaymentMock.mockResolvedValue({
+                result: { id: 'CAPTURE-9', status: 'COMPLETED', amount: { currencyCode: 'USD', value: '10.00' } },
+            });
+
+            const result = await createService().captureAuthorization('AUTH-1');
+            expect(result).toEqual({
+                captureId: 'CAPTURE-9',
+                captureStatus: 'COMPLETED',
+                currencyCode: 'USD',
+                value: '10.00',
+            });
+            expect(captureAuthorizedPaymentMock.mock.calls[0][0]).toMatchObject({
+                authorizationId: 'AUTH-1',
+                body: { finalCapture: true },
+            });
+        });
+
+        it('throws when the response contains no capture', async () => {
+            captureAuthorizedPaymentMock.mockResolvedValue({ result: {} });
+            await expect(createService().captureAuthorization('AUTH-1')).rejects.toThrow(
+                /did not contain a capture/,
+            );
+        });
+
+        it('wraps SDK errors with a safe message', async () => {
+            captureAuthorizedPaymentMock.mockRejectedValue(new Error('nope'));
+            await expect(createService().captureAuthorization('AUTH-1')).rejects.toThrow(
+                /Failed to capture the authorized PayPal payment: nope/,
+            );
+        });
+    });
+
+    describe('resilience (retry + idempotency)', () => {
+        it('retries a transient timeout and succeeds on the next attempt', async () => {
+            // First attempt times out before PayPal captures; the pre-retry status
+            // check shows the authorization is still uncaptured, so the retry
+            // performs the capture and succeeds.
+            captureAuthorizedPaymentMock
+                .mockRejectedValueOnce(transientError())
+                .mockResolvedValueOnce({
+                    result: { id: 'CAPTURE-RETRY', status: 'COMPLETED', amount: { currencyCode: 'USD', value: '10.00' } },
+                });
+            getAuthorizedPaymentMock.mockResolvedValue({ result: { status: 'CREATED' } });
+
+            const result = await createService().captureAuthorization('AUTH-1', 'PAYPAL-ORDER-1');
+
+            expect(result.captureId).toBe('CAPTURE-RETRY');
+            expect(captureAuthorizedPaymentMock).toHaveBeenCalledTimes(2);
+        });
+
+        it('does not double-capture: recovers the existing capture after a timed-out success', async () => {
+            // First attempt times out AFTER PayPal captured. On retry the status
+            // check reports CAPTURED, so we recover the capture from the order and
+            // never call capture again.
+            captureAuthorizedPaymentMock.mockRejectedValueOnce(transientError());
+            getAuthorizedPaymentMock.mockResolvedValue({ result: { status: 'CAPTURED' } });
+            getOrderMock.mockResolvedValue({
+                result: {
+                    purchaseUnits: [
+                        {
+                            payments: {
+                                captures: [
+                                    { id: 'CAPTURE-EXISTING', status: 'COMPLETED', amount: { currencyCode: 'USD', value: '10.00' } },
+                                ],
+                            },
+                        },
+                    ],
+                },
+            });
+
+            const result = await createService().captureAuthorization('AUTH-1', 'PAYPAL-ORDER-1');
+
+            expect(result).toEqual({
+                captureId: 'CAPTURE-EXISTING',
+                captureStatus: 'COMPLETED',
+                currencyCode: 'USD',
+                value: '10.00',
+            });
+            // The capture endpoint was only hit once (the timed-out attempt).
+            expect(captureAuthorizedPaymentMock).toHaveBeenCalledTimes(1);
+            expect(getOrderMock).toHaveBeenCalledWith({ id: 'PAYPAL-ORDER-1' });
+        });
+
+        it('does not retry non-transient errors', async () => {
+            captureOrderMock.mockRejectedValue(new Error('bad request'));
+
+            await expect(createService().captureOrder('PAYPAL-ORDER-1')).rejects.toThrow(
+                /Failed to capture the PayPal order/,
+            );
+            expect(captureOrderMock).toHaveBeenCalledTimes(1);
+        });
+
+        it('retries createOrder on a transient timeout', async () => {
+            createOrderMock.mockRejectedValueOnce(transientError()).mockResolvedValueOnce({
+                result: { id: 'O', status: 'CREATED', links: [{ rel: 'approve', href: 'https://x' }] },
+            });
+
+            const result = await createService().createOrder(1000, 'USD', 'ORDER-RETRY');
+
+            expect(result.paypalOrderId).toBe('O');
+            expect(createOrderMock).toHaveBeenCalledTimes(2);
         });
     });
 });

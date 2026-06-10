@@ -1,4 +1,4 @@
-import { Mutation, Resolver } from '@nestjs/graphql';
+import { Args, Mutation, Resolver } from '@nestjs/graphql';
 import {
     ActiveOrderService,
     Allow,
@@ -9,7 +9,7 @@ import {
 } from '@vendure/core';
 
 import { PayPalService } from '../paypal.service';
-import { CreatePayPalOrderResult } from '../types';
+import { CreatePayPalOrderResult, PayPalIntent } from '../types';
 
 @Resolver()
 export class PayPalShopResolver {
@@ -20,13 +20,17 @@ export class PayPalShopResolver {
 
     /**
      * @description
-     * Creates a PayPal order (CAPTURE intent) for the customer's active order
-     * and returns the approval URL to which the storefront must redirect the
-     * buyer.
+     * Creates a PayPal order for the customer's active order and returns the
+     * approval URL to which the storefront must redirect the buyer. The
+     * `intent` argument selects immediate capture (Use Case 1) or
+     * authorize-then-capture (Use Case 2).
      */
     @Mutation()
     @Allow(Permission.Public)
-    async createPayPalOrder(@Ctx() ctx: RequestContext): Promise<CreatePayPalOrderResult> {
+    async createPayPalOrder(
+        @Ctx() ctx: RequestContext,
+        @Args() args: { intent?: 'CAPTURE' | 'AUTHORIZE' },
+    ): Promise<CreatePayPalOrderResult> {
         const order = await this.activeOrderService.getActiveOrder(ctx, undefined);
         if (!order) {
             throw new UserInputError('No active order found for the current session');
@@ -34,6 +38,12 @@ export class PayPalShopResolver {
         if (order.totalWithTax <= 0) {
             throw new UserInputError('Cannot create a PayPal order for a zero-value order');
         }
-        return this.payPalService.createOrder(order.totalWithTax, order.currencyCode, order.code);
+        const intent: PayPalIntent = args.intent === 'AUTHORIZE' ? 'authorize' : 'capture';
+        return this.payPalService.createOrder(
+            order.totalWithTax,
+            order.currencyCode,
+            order.code,
+            intent,
+        );
     }
 }
