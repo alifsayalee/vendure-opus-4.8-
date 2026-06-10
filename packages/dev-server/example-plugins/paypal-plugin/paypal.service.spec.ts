@@ -8,6 +8,17 @@ const captureAuthorizedPaymentMock = vi.fn();
 const getAuthorizedPaymentMock = vi.fn();
 const voidPaymentMock = vi.fn();
 const refundCapturedPaymentMock = vi.fn();
+const createBillingPlanMock = vi.fn();
+const activateBillingPlanMock = vi.fn();
+const deactivateBillingPlanMock = vi.fn();
+const updateBillingPlanPricingSchemesMock = vi.fn();
+const patchBillingPlanMock = vi.fn();
+const createSubscriptionMock = vi.fn();
+const getSubscriptionMock = vi.fn();
+const activateSubscriptionMock = vi.fn();
+const suspendSubscriptionMock = vi.fn();
+const cancelSubscriptionMock = vi.fn();
+const captureSubscriptionMock = vi.fn();
 
 // Mock the PayPal SDK: keep the real enums/error classes, but replace the
 // network-facing Client and controllers with controllable stubs.
@@ -27,6 +38,19 @@ vi.mock('@paypal/paypal-server-sdk', async importOriginal => {
             getAuthorizedPayment = getAuthorizedPaymentMock;
             voidPayment = voidPaymentMock;
             refundCapturedPayment = refundCapturedPaymentMock;
+        },
+        SubscriptionsController: class {
+            createBillingPlan = createBillingPlanMock;
+            activateBillingPlan = activateBillingPlanMock;
+            deactivateBillingPlan = deactivateBillingPlanMock;
+            updateBillingPlanPricingSchemes = updateBillingPlanPricingSchemesMock;
+            patchBillingPlan = patchBillingPlanMock;
+            createSubscription = createSubscriptionMock;
+            getSubscription = getSubscriptionMock;
+            activateSubscription = activateSubscriptionMock;
+            suspendSubscription = suspendSubscriptionMock;
+            cancelSubscription = cancelSubscriptionMock;
+            captureSubscription = captureSubscriptionMock;
         },
     };
 });
@@ -70,6 +94,17 @@ describe('PayPalService', () => {
         getAuthorizedPaymentMock.mockReset();
         voidPaymentMock.mockReset();
         refundCapturedPaymentMock.mockReset();
+        createBillingPlanMock.mockReset();
+        activateBillingPlanMock.mockReset();
+        deactivateBillingPlanMock.mockReset();
+        updateBillingPlanPricingSchemesMock.mockReset();
+        patchBillingPlanMock.mockReset();
+        createSubscriptionMock.mockReset();
+        getSubscriptionMock.mockReset();
+        activateSubscriptionMock.mockReset();
+        suspendSubscriptionMock.mockReset();
+        cancelSubscriptionMock.mockReset();
+        captureSubscriptionMock.mockReset();
     });
 
     describe('createOrder', () => {
@@ -446,6 +481,134 @@ describe('PayPalService', () => {
 
             expect(result.paypalOrderId).toBe('O');
             expect(createOrderMock).toHaveBeenCalledTimes(2);
+        });
+    });
+
+    describe('subscriptions (Use Case 6)', () => {
+        it('creates an ACTIVE billing plan with one fixed-price regular cycle', async () => {
+            createBillingPlanMock.mockResolvedValue({ result: { id: 'P-1', status: 'ACTIVE' } });
+
+            const result = await createService().createBillingPlan(
+                {
+                    productId: 'PROD-1',
+                    name: 'Monthly',
+                    amountMinorUnits: 999,
+                    currencyCode: 'USD',
+                    intervalUnit: 'MONTH',
+                    intervalCount: 1,
+                    paymentFailureThreshold: 2,
+                    activateImmediately: true,
+                },
+                'plan-key',
+            );
+
+            expect(result).toEqual({ planId: 'P-1', status: 'ACTIVE' });
+            const body = createBillingPlanMock.mock.calls[0][0].body;
+            expect(body.status).toBe('ACTIVE');
+            expect(body.billingCycles[0].frequency).toEqual({ intervalUnit: 'MONTH', intervalCount: 1 });
+            expect(body.billingCycles[0].tenureType).toBe('REGULAR');
+            expect(body.billingCycles[0].pricingScheme.fixedPrice).toEqual({
+                currencyCode: 'USD',
+                value: '9.99',
+            });
+            expect(body.paymentPreferences.paymentFailureThreshold).toBe(2);
+            expect(createBillingPlanMock.mock.calls[0][0].paypalRequestId).toBe('plan-key');
+        });
+
+        it('creates a subscription and extracts the approval URL and status', async () => {
+            // The SDK strips the undeclared `status` from `result`; it is only
+            // present in the raw response body.
+            createSubscriptionMock.mockResolvedValue({
+                result: {
+                    id: 'SUB-1',
+                    planId: 'P-1',
+                    links: [
+                        { rel: 'approve', href: 'https://www.sandbox.paypal.com/webapps/billing/subscriptions?ba_token=X' },
+                    ],
+                },
+                body: JSON.stringify({ id: 'SUB-1', status: 'APPROVAL_PENDING' }),
+            });
+
+            const result = await createService().createSubscription(
+                { planId: 'P-1', brandName: 'Shop' },
+                'sub-key',
+            );
+
+            expect(result).toEqual({
+                subscriptionId: 'SUB-1',
+                status: 'APPROVAL_PENDING',
+                planId: 'P-1',
+                approvalUrl: 'https://www.sandbox.paypal.com/webapps/billing/subscriptions?ba_token=X',
+            });
+            const passed = createSubscriptionMock.mock.calls[0][0];
+            expect(passed.paypalRequestId).toBe('sub-key');
+            expect(passed.body.applicationContext).toMatchObject({
+                returnUrl: options.returnUrl,
+                cancelUrl: options.cancelUrl,
+                brandName: 'Shop',
+            });
+        });
+
+        it('reads subscription status from the raw body when the SDK strips it from result', async () => {
+            // Reproduces the real SDK behaviour: `result` has no `status` (the
+            // model does not declare it), but the raw body does. Regression test
+            // for sync returning APPROVAL_PENDING for an ACTIVE subscription.
+            getSubscriptionMock.mockResolvedValue({
+                result: { id: 'SUB-1', planId: 'P-1' },
+                body: JSON.stringify({ id: 'SUB-1', plan_id: 'P-1', status: 'ACTIVE' }),
+            });
+            const result = await createService().getSubscription('SUB-1');
+            expect(result).toEqual({ subscriptionId: 'SUB-1', status: 'ACTIVE', planId: 'P-1' });
+        });
+
+        it('falls back to the typed result status when no body is present', async () => {
+            getSubscriptionMock.mockResolvedValue({ result: { id: 'SUB-1', planId: 'P-1', status: 'SUSPENDED' } });
+            const result = await createService().getSubscription('SUB-1');
+            expect(result.status).toBe('SUSPENDED');
+        });
+
+        it('updates plan pricing with a fixed price for the billing cycle', async () => {
+            updateBillingPlanPricingSchemesMock.mockResolvedValue({ result: undefined });
+            await createService().updatePlanPricing('P-1', 1500, 'USD');
+            const passed = updateBillingPlanPricingSchemesMock.mock.calls[0][0];
+            expect(passed.id).toBe('P-1');
+            expect(passed.body.pricingSchemes[0]).toEqual({
+                billingCycleSequence: 1,
+                pricingScheme: { fixedPrice: { currencyCode: 'USD', value: '15.00' } },
+            });
+        });
+
+        it('patches the payment failure threshold via a replace op', async () => {
+            patchBillingPlanMock.mockResolvedValue({ result: undefined });
+            await createService().updatePlanPaymentFailureThreshold('P-1', 3);
+            expect(patchBillingPlanMock.mock.calls[0][0].body).toEqual([
+                { op: 'replace', path: '/payment_preferences/payment_failure_threshold', value: 3 },
+            ]);
+        });
+
+        it('cancels a subscription with a reason', async () => {
+            cancelSubscriptionMock.mockResolvedValue({ result: undefined });
+            await createService().cancelSubscription('SUB-1', 'Customer request');
+            expect(cancelSubscriptionMock.mock.calls[0][0]).toEqual({
+                id: 'SUB-1',
+                body: { reason: 'Customer request' },
+            });
+        });
+
+        it('captures the outstanding balance to retry a failed payment', async () => {
+            captureSubscriptionMock.mockResolvedValue({ result: null });
+            await createService().captureSubscriptionPayment('SUB-1', 999, 'USD', 'Retry');
+            expect(captureSubscriptionMock.mock.calls[0][0]).toEqual({
+                id: 'SUB-1',
+                body: { note: 'Retry', captureType: 'OUTSTANDING_BALANCE', amount: { currencyCode: 'USD', value: '9.99' } },
+            });
+        });
+
+        it('wraps subscription SDK errors with a safe message', async () => {
+            createSubscriptionMock.mockRejectedValue(new Error('plan inactive'));
+            await expect(
+                createService().createSubscription({ planId: 'P-1' }, 'k'),
+            ).rejects.toThrow(/Failed to create the subscription: plan inactive/);
         });
     });
 });
