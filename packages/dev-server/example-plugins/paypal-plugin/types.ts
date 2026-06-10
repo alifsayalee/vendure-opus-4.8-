@@ -42,6 +42,14 @@ export interface PayPalPluginOptions {
 
 /**
  * @description
+ * The PayPal order intent. `capture` settles funds immediately on capture
+ * (Use Case 1); `authorize` reserves funds at checkout and captures them later
+ * on order fulfilment (Use Case 2).
+ */
+export type PayPalIntent = 'capture' | 'authorize';
+
+/**
+ * @description
  * The result of creating a PayPal order, returned to the storefront so it can
  * redirect the buyer to PayPal for approval.
  */
@@ -66,6 +74,41 @@ export interface CapturePayPalOrderResult {
     /** The PayPal capture id, used for later refund operations. */
     captureId: string;
     /** The status of the individual capture (`COMPLETED` on success). */
+    captureStatus: string;
+    /** The captured currency code, as reported by PayPal. */
+    currencyCode?: string;
+    /** The captured amount as a decimal string, as reported by PayPal. */
+    value?: string;
+}
+
+/**
+ * @description
+ * The result of authorizing an approved PayPal order (Use Case 2). The
+ * authorization reserves the funds without moving money.
+ */
+export interface AuthorizePayPalOrderResult {
+    /** The PayPal-generated order id that was authorized. */
+    paypalOrderId: string;
+    /** The order-level status after authorization (`COMPLETED` on success). */
+    orderStatus: string;
+    /** The PayPal authorization id, used to later capture or void the funds. */
+    authorizationId: string;
+    /** The status of the authorization (`CREATED` when funds are reserved). */
+    authorizationStatus: string;
+    /** The authorized currency code, as reported by PayPal. */
+    currencyCode?: string;
+    /** The authorized amount as a decimal string, as reported by PayPal. */
+    value?: string;
+}
+
+/**
+ * @description
+ * The result of capturing a previously authorized PayPal payment (Use Case 2).
+ */
+export interface CaptureAuthorizationResult {
+    /** The PayPal capture id, used for later refund operations. */
+    captureId: string;
+    /** The status of the capture (`COMPLETED` on success). */
     captureStatus: string;
     /** The captured currency code, as reported by PayPal. */
     currencyCode?: string;

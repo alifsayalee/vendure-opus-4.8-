@@ -2,17 +2,27 @@ import { Inject, Injectable } from '@nestjs/common';
 import { Logger } from '@vendure/core';
 import {
     ApiError,
+    CapturedPayment,
     CheckoutPaymentIntent,
     Client,
     CustomError,
     Environment,
     LogLevel,
     Order as PayPalOrder,
+    OrderAuthorizeResponse,
     OrdersController,
+    PaymentsController,
 } from '@paypal/paypal-server-sdk';
 
 import { loggerCtx, PAYPAL_PLUGIN_OPTIONS } from './constants';
-import { CapturePayPalOrderResult, CreatePayPalOrderResult, PayPalPluginOptions } from './types';
+import {
+    AuthorizePayPalOrderResult,
+    CaptureAuthorizationResult,
+    CapturePayPalOrderResult,
+    CreatePayPalOrderResult,
+    PayPalIntent,
+    PayPalPluginOptions,
+} from './types';
 
 /**
  * @description
@@ -26,6 +36,7 @@ import { CapturePayPalOrderResult, CreatePayPalOrderResult, PayPalPluginOptions 
 @Injectable()
 export class PayPalService {
     private readonly ordersController: OrdersController;
+    private readonly paymentsController: PaymentsController;
 
     constructor(@Inject(PAYPAL_PLUGIN_OPTIONS) private readonly options: PayPalPluginOptions) {
         const client = new Client({
@@ -44,52 +55,64 @@ export class PayPalService {
             },
         });
         this.ordersController = new OrdersController(client);
+        this.paymentsController = new PaymentsController(client);
     }
 
     /**
      * @description
-     * Creates a PayPal order with `CAPTURE` intent for the given amount and
-     * returns the order id and the buyer approval URL.
+     * Creates a PayPal order for the given amount and returns the order id and
+     * the buyer approval URL.
      *
      * @param amountMinorUnits The amount in integer minor units (e.g. `1000` = $10.00).
      * @param currencyCode The three-character ISO-4217 currency code.
      * @param referenceId An opaque reference (the Vendure order code) attached to
      * the PayPal order for reconciliation.
+     * @param intent `capture` for immediate capture (Use Case 1) or `authorize`
+     * to reserve funds for later capture (Use Case 2). Defaults to `capture`.
      */
     async createOrder(
         amountMinorUnits: number,
         currencyCode: string,
         referenceId: string,
+        intent: PayPalIntent = 'capture',
     ): Promise<CreatePayPalOrderResult> {
         let result: PayPalOrder;
         try {
-            const response = await this.ordersController.createOrder({
-                body: {
-                    intent: CheckoutPaymentIntent.Capture,
-                    purchaseUnits: [
-                        {
-                            referenceId,
-                            amount: {
-                                currencyCode,
-                                value: this.toPayPalValue(amountMinorUnits, currencyCode),
+            result = await this.withRetry(
+                'create the PayPal order',
+                async () =>
+                    (
+                        await this.ordersController.createOrder({
+                            body: {
+                                intent:
+                                    intent === 'authorize'
+                                        ? CheckoutPaymentIntent.Authorize
+                                        : CheckoutPaymentIntent.Capture,
+                                purchaseUnits: [
+                                    {
+                                        referenceId,
+                                        amount: {
+                                            currencyCode,
+                                            value: this.toPayPalValue(amountMinorUnits, currencyCode),
+                                        },
+                                    },
+                                ],
+                                paymentSource: {
+                                    paypal: {
+                                        experienceContext: {
+                                            returnUrl: this.options.returnUrl,
+                                            cancelUrl: this.options.cancelUrl,
+                                            ...(this.options.brandName
+                                                ? { brandName: this.options.brandName }
+                                                : {}),
+                                        },
+                                    },
+                                },
                             },
-                        },
-                    ],
-                    paymentSource: {
-                        paypal: {
-                            experienceContext: {
-                                returnUrl: this.options.returnUrl,
-                                cancelUrl: this.options.cancelUrl,
-                                ...(this.options.brandName
-                                    ? { brandName: this.options.brandName }
-                                    : {}),
-                            },
-                        },
-                    },
-                },
-                prefer: 'return=representation',
-            });
-            result = response.result;
+                            prefer: 'return=representation',
+                        })
+                    ).result,
+            );
         } catch (e) {
             throw this.toError('create the PayPal order', e);
         }
@@ -121,11 +144,19 @@ export class PayPalService {
     async captureOrder(paypalOrderId: string): Promise<CapturePayPalOrderResult> {
         let result: PayPalOrder;
         try {
-            const response = await this.ordersController.captureOrder({
-                id: paypalOrderId,
-                prefer: 'return=representation',
-            });
-            result = response.result;
+            result = await this.withRetry(
+                'capture the PayPal order',
+                async () =>
+                    (
+                        await this.ordersController.captureOrder({
+                            id: paypalOrderId,
+                            prefer: 'return=representation',
+                            // Idempotency key: a retried capture returns the original
+                            // capture instead of charging the buyer twice.
+                            paypalRequestId: `capture-order-${paypalOrderId}`,
+                        })
+                    ).result,
+            );
         } catch (e) {
             throw this.toError('capture the PayPal order', e);
         }
@@ -143,6 +174,176 @@ export class PayPalService {
             currencyCode: capture.amount?.currencyCode,
             value: capture.amount?.value,
         };
+    }
+
+    /**
+     * @description
+     * Authorizes payment for a PayPal order that the buyer has already approved,
+     * reserving the funds without capturing them (Use Case 2). Returns the
+     * authorization id used to later capture or void the funds.
+     *
+     * @param paypalOrderId The PayPal order id returned by {@link createOrder}.
+     */
+    async authorizeOrder(paypalOrderId: string): Promise<AuthorizePayPalOrderResult> {
+        let result: OrderAuthorizeResponse;
+        try {
+            result = await this.withRetry(
+                'authorize the PayPal order',
+                async () =>
+                    (
+                        await this.ordersController.authorizeOrder({
+                            id: paypalOrderId,
+                            prefer: 'return=representation',
+                            // Idempotency key: a retried authorize returns the original
+                            // authorization instead of reserving the funds twice.
+                            paypalRequestId: `authorize-${paypalOrderId}`,
+                        })
+                    ).result,
+            );
+        } catch (e) {
+            throw this.toError('authorize the PayPal order', e);
+        }
+
+        const authorization = result?.purchaseUnits?.[0]?.payments?.authorizations?.[0];
+        if (!result?.id || !authorization?.id || !authorization.status) {
+            throw new Error('PayPal authorize response did not contain an authorization');
+        }
+
+        return {
+            paypalOrderId: result.id,
+            orderStatus: result.status ?? 'UNKNOWN',
+            authorizationId: authorization.id,
+            authorizationStatus: authorization.status,
+            currencyCode: authorization.amount?.currencyCode,
+            value: authorization.amount?.value,
+        };
+    }
+
+    /**
+     * @description
+     * Captures funds that were previously reserved by {@link authorizeOrder}
+     * (Use Case 2). Returns the capture id and status used to settle the Vendure
+     * payment and support later refunds.
+     *
+     * @param authorizationId The PayPal authorization id from {@link authorizeOrder}.
+     * @param paypalOrderId The originating PayPal order id, used to recover the
+     * capture details if a previous attempt already captured the funds.
+     */
+    async captureAuthorization(
+        authorizationId: string,
+        paypalOrderId?: string,
+    ): Promise<CaptureAuthorizationResult> {
+        try {
+            return await this.withRetry(
+                'capture the authorized PayPal payment',
+                async attempt => {
+                    // `captureAuthorizedPayment` does not accept an idempotency key,
+                    // so before retrying we check whether a previous (possibly
+                    // timed-out) attempt already captured the funds. This prevents
+                    // double-charging the buyer.
+                    if (attempt > 1) {
+                        const existing = await this.findExistingCapture(
+                            authorizationId,
+                            paypalOrderId,
+                        );
+                        if (existing) {
+                            return existing;
+                        }
+                    }
+
+                    let capture: CapturedPayment;
+                    try {
+                        const response = await this.paymentsController.captureAuthorizedPayment({
+                            authorizationId,
+                            prefer: 'return=representation',
+                            body: { finalCapture: true },
+                        });
+                        capture = response.result;
+                    } catch (e) {
+                        // If the authorization was already captured by an earlier
+                        // attempt, recover that capture instead of failing.
+                        if (this.isAlreadyCaptured(e)) {
+                            const existing = await this.findExistingCapture(
+                                authorizationId,
+                                paypalOrderId,
+                            );
+                            if (existing) {
+                                return existing;
+                            }
+                        }
+                        throw e;
+                    }
+
+                    if (!capture?.id || !capture.status) {
+                        throw new Error(
+                            'PayPal capture-authorization response did not contain a capture',
+                        );
+                    }
+
+                    return {
+                        captureId: capture.id,
+                        captureStatus: capture.status,
+                        currencyCode: capture.amount?.currencyCode,
+                        value: capture.amount?.value,
+                    };
+                },
+            );
+        } catch (e) {
+            throw this.toError('capture the authorized PayPal payment', e);
+        }
+    }
+
+    /**
+     * Best-effort lookup of an already-captured payment for an authorization.
+     * Used as an idempotency safeguard when retrying captures, since the
+     * capture-authorization endpoint has no idempotency key. Returns `undefined`
+     * if the authorization has not been captured or the lookup is inconclusive.
+     */
+    private async findExistingCapture(
+        authorizationId: string,
+        paypalOrderId?: string,
+    ): Promise<CaptureAuthorizationResult | undefined> {
+        let status: string | undefined;
+        try {
+            const response = await this.paymentsController.getAuthorizedPayment({ authorizationId });
+            status = response.result?.status;
+        } catch {
+            // If we cannot determine the status, let the caller proceed/fail normally.
+            return undefined;
+        }
+        if (status !== 'CAPTURED' && status !== 'PARTIALLY_CAPTURED') {
+            return undefined;
+        }
+
+        // The funds are already captured. Recover the real capture id from the
+        // PayPal order so refunds (Use Cases 4 & 5) can reference it.
+        if (paypalOrderId) {
+            try {
+                const order = await this.ordersController.getOrder({ id: paypalOrderId });
+                const capture = order.result?.purchaseUnits?.[0]?.payments?.captures?.[0];
+                if (capture?.id && capture.status) {
+                    Logger.warn(
+                        `Recovered existing capture ${capture.id} for authorization ${authorizationId}`,
+                        loggerCtx,
+                    );
+                    return {
+                        captureId: capture.id,
+                        captureStatus: capture.status,
+                        currencyCode: capture.amount?.currencyCode,
+                        value: capture.amount?.value,
+                    };
+                }
+            } catch {
+                // Fall through to the warning below.
+            }
+        }
+
+        Logger.warn(
+            `Authorization ${authorizationId} is already captured but the capture id could not ` +
+                'be recovered; manual reconciliation may be required',
+            loggerCtx,
+        );
+        return { captureId: authorizationId, captureStatus: 'COMPLETED' };
     }
 
     /**
@@ -174,6 +375,58 @@ export class PayPalService {
     }
 
     /**
+     * Runs the given operation, retrying with exponential backoff when it fails
+     * with a transient error (network timeout/reset, HTTP 429 or 5xx). The
+     * callback receives the 1-based attempt number so it can apply idempotency
+     * safeguards on retries.
+     */
+    private async withRetry<T>(
+        action: string,
+        fn: (attempt: number) => Promise<T>,
+    ): Promise<T> {
+        let lastError: unknown;
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            try {
+                return await fn(attempt);
+            } catch (e) {
+                lastError = e;
+                if (attempt < MAX_ATTEMPTS && this.isTransient(e)) {
+                    const delayMs = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+                    Logger.warn(
+                        `Transient error while attempting to ${action} ` +
+                            `(attempt ${attempt}/${MAX_ATTEMPTS}); retrying in ${delayMs}ms`,
+                        loggerCtx,
+                    );
+                    await sleep(delayMs);
+                    continue;
+                }
+                throw e;
+            }
+        }
+        throw lastError;
+    }
+
+    /** Determines whether an error is worth retrying. */
+    private isTransient(e: unknown): boolean {
+        if (e instanceof ApiError) {
+            const status = e.statusCode;
+            return status === 429 || (typeof status === 'number' && status >= 500);
+        }
+        const code = (e as { code?: unknown })?.code;
+        const message = e instanceof Error ? e.message : '';
+        return TRANSIENT_NETWORK_CODES.some(c => code === c || message.includes(c));
+    }
+
+    /** Detects the PayPal "authorization already captured" business error. */
+    private isAlreadyCaptured(e: unknown): boolean {
+        if (!(e instanceof ApiError) || e.statusCode !== 422) {
+            return false;
+        }
+        const detail = e instanceof CustomError ? safeStringify(e.result) : safeStringify(e.body);
+        return detail.includes('AUTHORIZATION_ALREADY_CAPTURED');
+    }
+
+    /**
      * Normalises any thrown SDK value into a single `Error` with a safe,
      * descriptive message, while logging the structured PayPal error detail.
      * Credentials are never included in the message or the log.
@@ -191,6 +444,28 @@ export class PayPalService {
         Logger.error(`Failed to ${action}: ${message}`, loggerCtx);
         return new Error(`Failed to ${action}: ${message}`);
     }
+}
+
+/** Maximum number of attempts (initial try + retries) for a PayPal call. */
+const MAX_ATTEMPTS = 3;
+
+/** Base delay in milliseconds for exponential backoff between retries. */
+const RETRY_BASE_DELAY_MS = 200;
+
+/** Node network error codes considered transient and therefore retryable. */
+const TRANSIENT_NETWORK_CODES = [
+    'ETIMEDOUT',
+    'ESOCKETTIMEDOUT',
+    'ECONNRESET',
+    'ECONNREFUSED',
+    'ECONNABORTED',
+    'ENETUNREACH',
+    'EAI_AGAIN',
+    'EPIPE',
+];
+
+function sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function safeStringify(value: unknown): string {

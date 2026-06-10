@@ -7,6 +7,15 @@ import gql from 'graphql-tag';
  * which the storefront uses to redirect the customer to PayPal.
  */
 export const shopApiExtensions = gql`
+    """
+    The PayPal order intent: CAPTURE settles funds immediately (Use Case 1);
+    AUTHORIZE reserves funds for later capture on fulfilment (Use Case 2).
+    """
+    enum PayPalOrderIntent {
+        CAPTURE
+        AUTHORIZE
+    }
+
     type CreatePayPalOrderResult {
         paypalOrderId: String!
         status: String!
@@ -14,6 +23,6 @@ export const shopApiExtensions = gql`
     }
 
     extend type Mutation {
-        createPayPalOrder: CreatePayPalOrderResult!
+        createPayPalOrder(intent: PayPalOrderIntent = CAPTURE): CreatePayPalOrderResult!
     }
 `;

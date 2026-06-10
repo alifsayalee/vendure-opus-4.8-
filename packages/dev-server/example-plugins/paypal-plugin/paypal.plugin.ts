@@ -14,10 +14,15 @@ import {
 
 import { shopApiExtensions } from './api/api-extensions';
 import { PayPalShopResolver } from './api/paypal-shop.resolver';
-import { loggerCtx, PAYPAL_PAYMENT_METHOD_CODE, PAYPAL_PLUGIN_OPTIONS } from './constants';
+import {
+    loggerCtx,
+    PAYPAL_AUTHORIZE_PAYMENT_METHOD_CODE,
+    PAYPAL_PAYMENT_METHOD_CODE,
+    PAYPAL_PLUGIN_OPTIONS,
+} from './constants';
 import { payPalPaymentHandler } from './paypal-payment-handler';
 import { PayPalService } from './paypal.service';
-import { PayPalPluginOptions } from './types';
+import { PayPalIntent, PayPalPluginOptions } from './types';
 
 /**
  * @description
@@ -86,17 +91,29 @@ export class PayPalPlugin implements OnApplicationBootstrap {
     }
 
     async onApplicationBootstrap(): Promise<void> {
-        await this.ensurePaymentMethodExists();
+        // Use Case 1 — immediate capture.
+        await this.ensurePaymentMethodExists(PAYPAL_PAYMENT_METHOD_CODE, 'PayPal', 'capture');
+        // Use Case 2 — authorize then capture.
+        await this.ensurePaymentMethodExists(
+            PAYPAL_AUTHORIZE_PAYMENT_METHOD_CODE,
+            'PayPal (Authorize then Capture)',
+            'authorize',
+        );
     }
 
     /**
-     * Creates the PayPal {@link PaymentMethod} on first boot if it does not yet
+     * Creates a PayPal {@link PaymentMethod} on first boot if it does not yet
      * exist, and assigns it to all channels. This makes the method immediately
-     * usable without any manual Admin UI configuration.
+     * usable without any manual Admin UI configuration. Both methods share the
+     * same handler, differing only by the configured `intent`.
      */
-    private async ensurePaymentMethodExists(): Promise<void> {
+    private async ensurePaymentMethodExists(
+        code: string,
+        name: string,
+        intent: PayPalIntent,
+    ): Promise<void> {
         const existing = await this.connection.rawConnection.getRepository(PaymentMethod).findOne({
-            where: { code: PAYPAL_PAYMENT_METHOD_CODE },
+            where: { code },
         });
         if (existing) {
             return;
@@ -104,10 +121,13 @@ export class PayPalPlugin implements OnApplicationBootstrap {
         const ctx = await this.requestContextService.create({ apiType: 'admin' });
         const allChannels = await this.connection.getRepository(ctx, Channel).find();
         const paymentMethod = await this.paymentMethodService.create(ctx, {
-            code: PAYPAL_PAYMENT_METHOD_CODE,
+            code,
             enabled: true,
-            handler: { code: payPalPaymentHandler.code, arguments: [] },
-            translations: [{ languageCode: LanguageCode.en, name: 'PayPal' }],
+            handler: {
+                code: payPalPaymentHandler.code,
+                arguments: [{ name: 'intent', value: intent }],
+            },
+            translations: [{ languageCode: LanguageCode.en, name }],
         });
         await this.channelService.assignToChannels(
             ctx,
@@ -115,6 +135,6 @@ export class PayPalPlugin implements OnApplicationBootstrap {
             paymentMethod.id,
             allChannels.map(c => c.id),
         );
-        Logger.info(`Created "${PAYPAL_PAYMENT_METHOD_CODE}" payment method`, loggerCtx);
+        Logger.info(`Created "${code}" payment method`, loggerCtx);
     }
 }
