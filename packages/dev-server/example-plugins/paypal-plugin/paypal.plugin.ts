@@ -32,6 +32,8 @@ import {
 import { PayPalSubscription } from './subscription/paypal-subscription.entity';
 import { PayPalSubscriptionService } from './subscription/paypal-subscription.service';
 import { payPalSubscriptionSyncTask } from './subscription/paypal-subscription-sync.task';
+import { PayPalReportingAdminResolver } from './reporting/api/paypal-reporting-admin.resolver';
+import { reportingAdminApiExtensions } from './reporting/api/reporting-api-extensions';
 import { PayPalIntent, PayPalPluginOptions } from './types';
 
 /**
@@ -81,8 +83,11 @@ import { PayPalIntent, PayPalPluginOptions } from './types';
         resolvers: [PayPalShopResolver, PayPalSubscriptionShopResolver],
     },
     adminApiExtensions: {
-        schema: subscriptionAdminApiExtensions,
-        resolvers: [PayPalSubscriptionAdminResolver],
+        schema: gql`
+            ${subscriptionAdminApiExtensions}
+            ${reportingAdminApiExtensions}
+        `,
+        resolvers: [PayPalSubscriptionAdminResolver, PayPalReportingAdminResolver],
     },
     providers: [
         PayPalService,

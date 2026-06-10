@@ -23,6 +23,7 @@ import {
     Subscription as PayPalSubscriptionResponse,
     SubscriptionsController,
     TenureType,
+    TransactionSearchController,
 } from '@paypal/paypal-server-sdk';
 
 import { loggerCtx, PAYPAL_PLUGIN_OPTIONS } from './constants';
@@ -43,6 +44,11 @@ import {
     GetSubscriptionResult,
     PayPalIntervalUnit,
 } from './subscription/subscription-types';
+import {
+    PayPalBalancesReport,
+    PayPalTransactionReport,
+    PayPalTransactionSummary,
+} from './reporting/reporting-types';
 
 /**
  * @description
@@ -58,6 +64,7 @@ export class PayPalService {
     private readonly ordersController: OrdersController;
     private readonly paymentsController: PaymentsController;
     private readonly subscriptionsController: SubscriptionsController;
+    private readonly transactionSearchController: TransactionSearchController;
 
     constructor(@Inject(PAYPAL_PLUGIN_OPTIONS) private readonly options: PayPalPluginOptions) {
         const client = new Client({
@@ -78,6 +85,7 @@ export class PayPalService {
         this.ordersController = new OrdersController(client);
         this.paymentsController = new PaymentsController(client);
         this.subscriptionsController = new SubscriptionsController(client);
+        this.transactionSearchController = new TransactionSearchController(client);
     }
 
     /**
@@ -741,6 +749,130 @@ export class PayPalService {
         }
     }
 
+    // ---------------------------------------------------------------------------
+    // Transaction reporting (Use Case 7)
+    // ---------------------------------------------------------------------------
+
+    /**
+     * @description
+     * Searches PayPal account activity within a date range. PayPal limits a
+     * single query to a 31-day range, so longer ranges are transparently split
+     * into consecutive windows and paginated, then stitched into one report.
+     *
+     * Note: executed transactions can take up to ~3 hours to appear, so this is
+     * intended for reconciliation, not real-time confirmation.
+     *
+     * @param startDateIso Inclusive range start (RFC 3339 / ISO-8601).
+     * @param endDateIso Inclusive range end (RFC 3339 / ISO-8601).
+     */
+    async searchTransactions(
+        startDateIso: string,
+        endDateIso: string,
+    ): Promise<PayPalTransactionReport> {
+        const start = new Date(startDateIso);
+        const end = new Date(endDateIso);
+        if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+            throw new Error('Invalid startDate or endDate');
+        }
+        if (start.getTime() >= end.getTime()) {
+            throw new Error('startDate must be before endDate');
+        }
+
+        const transactions: PayPalTransactionSummary[] = [];
+        let lastRefreshedAt: string | undefined;
+        try {
+            for (const window of splitIntoWindows(start, end, MAX_TX_RANGE_DAYS)) {
+                let page = 1;
+                let totalPages = 1;
+                do {
+                    const currentPage = page;
+                    const result = await this.withRetry('search transactions', async () =>
+                        (
+                            await this.transactionSearchController.searchTransactions({
+                                startDate: window.start,
+                                endDate: window.end,
+                                fields: 'transaction_info',
+                                balanceAffectingRecordsOnly: 'N',
+                                pageSize: TX_PAGE_SIZE,
+                                page: currentPage,
+                            })
+                        ).result,
+                    );
+                    totalPages = result?.totalPages ?? 1;
+                    lastRefreshedAt = result?.lastRefreshedDatetime ?? lastRefreshedAt;
+                    for (const detail of result?.transactionDetails ?? []) {
+                        const info = detail.transactionInfo;
+                        if (!info?.transactionId) {
+                            continue;
+                        }
+                        transactions.push({
+                            transactionId: info.transactionId,
+                            status: info.transactionStatus,
+                            eventCode: info.transactionEventCode,
+                            initiationDate: info.transactionInitiationDate,
+                            updatedDate: info.transactionUpdatedDate,
+                            currencyCode: info.transactionAmount?.currencyCode,
+                            value: info.transactionAmount?.value,
+                            feeCurrencyCode: info.feeAmount?.currencyCode,
+                            feeValue: info.feeAmount?.value,
+                        });
+                    }
+                    page++;
+                    if (page > MAX_TX_PAGES_PER_WINDOW) {
+                        Logger.warn(
+                            `Transaction report truncated at ${MAX_TX_PAGES_PER_WINDOW} pages for ` +
+                                `window ${window.start}..${window.end}`,
+                            loggerCtx,
+                        );
+                        break;
+                    }
+                } while (page <= totalPages);
+            }
+        } catch (e) {
+            throw this.toError('search transactions', e);
+        }
+
+        return {
+            startDate: startDateIso,
+            endDate: endDateIso,
+            totalItems: transactions.length,
+            lastRefreshedAt,
+            transactions,
+        };
+    }
+
+    /**
+     * @description
+     * Fetches the PayPal account balances. Balances are subject to the same
+     * ~3-hour reporting delay as transactions.
+     */
+    async getBalances(asOfTime?: string, currencyCode?: string): Promise<PayPalBalancesReport> {
+        let result: Awaited<ReturnType<TransactionSearchController['searchBalances']>>['result'];
+        try {
+            result = await this.withRetry('fetch balances', async () =>
+                (await this.transactionSearchController.searchBalances({ asOfTime, currencyCode }))
+                    .result,
+            );
+        } catch (e) {
+            throw this.toError('fetch balances', e);
+        }
+        return {
+            accountId: result?.accountId,
+            asOfTime: result?.asOfTime,
+            lastRefreshTime: result?.lastRefreshTime,
+            balances: (result?.balances ?? []).map(b => ({
+                currency: b.currency,
+                primary: b.primary ?? false,
+                totalCurrencyCode: b.totalBalance?.currencyCode,
+                totalValue: b.totalBalance?.value,
+                availableCurrencyCode: b.availableBalance?.currencyCode,
+                availableValue: b.availableBalance?.value,
+                withheldCurrencyCode: b.withheldBalance?.currencyCode,
+                withheldValue: b.withheldBalance?.value,
+            })),
+        };
+    }
+
     private toIntervalUnit(unit: PayPalIntervalUnit): IntervalUnit {
         switch (unit) {
             case 'WEEK':
@@ -874,6 +1006,37 @@ const TRANSIENT_NETWORK_CODES = [
 
 function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/** PayPal's maximum supported transaction-search range per query. */
+const MAX_TX_RANGE_DAYS = 31;
+/** Page size for transaction search (PayPal allows up to 500). */
+const TX_PAGE_SIZE = 500;
+/** Safety cap on pages fetched per window to bound very large reports. */
+const MAX_TX_PAGES_PER_WINDOW = 100;
+
+/**
+ * Splits an inclusive [start, end] range into consecutive, non-overlapping
+ * windows of at most `maxDays` days each, returned as RFC 3339 strings.
+ */
+function splitIntoWindows(
+    start: Date,
+    end: Date,
+    maxDays: number,
+): Array<{ start: string; end: string }> {
+    const windows: Array<{ start: string; end: string }> = [];
+    const maxMs = maxDays * 24 * 60 * 60 * 1000;
+    let cursor = start.getTime();
+    const endMs = end.getTime();
+    while (cursor < endMs) {
+        const windowEnd = Math.min(cursor + maxMs, endMs);
+        windows.push({
+            start: new Date(cursor).toISOString(),
+            end: new Date(windowEnd).toISOString(),
+        });
+        cursor = windowEnd;
+    }
+    return windows;
 }
 
 function safeStringify(value: unknown): string {

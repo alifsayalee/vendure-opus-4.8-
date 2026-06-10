@@ -19,6 +19,8 @@ const activateSubscriptionMock = vi.fn();
 const suspendSubscriptionMock = vi.fn();
 const cancelSubscriptionMock = vi.fn();
 const captureSubscriptionMock = vi.fn();
+const searchTransactionsMock = vi.fn();
+const searchBalancesMock = vi.fn();
 
 // Mock the PayPal SDK: keep the real enums/error classes, but replace the
 // network-facing Client and controllers with controllable stubs.
@@ -51,6 +53,10 @@ vi.mock('@paypal/paypal-server-sdk', async importOriginal => {
             suspendSubscription = suspendSubscriptionMock;
             cancelSubscription = cancelSubscriptionMock;
             captureSubscription = captureSubscriptionMock;
+        },
+        TransactionSearchController: class {
+            searchTransactions = searchTransactionsMock;
+            searchBalances = searchBalancesMock;
         },
     };
 });
@@ -105,6 +111,8 @@ describe('PayPalService', () => {
         suspendSubscriptionMock.mockReset();
         cancelSubscriptionMock.mockReset();
         captureSubscriptionMock.mockReset();
+        searchTransactionsMock.mockReset();
+        searchBalancesMock.mockReset();
     });
 
     describe('createOrder', () => {
@@ -609,6 +617,143 @@ describe('PayPalService', () => {
             await expect(
                 createService().createSubscription({ planId: 'P-1' }, 'k'),
             ).rejects.toThrow(/Failed to create the subscription: plan inactive/);
+        });
+    });
+
+    describe('transaction reporting (Use Case 7)', () => {
+        const txDetail = (id: string, value: string) => ({
+            transactionInfo: {
+                transactionId: id,
+                transactionStatus: 'S',
+                transactionEventCode: 'T0006',
+                transactionInitiationDate: '2024-01-05T10:00:00Z',
+                transactionAmount: { currencyCode: 'USD', value },
+                feeAmount: { currencyCode: 'USD', value: '-0.50' },
+            },
+        });
+
+        it('normalizes transactions for a single-window range', async () => {
+            searchTransactionsMock.mockResolvedValue({
+                result: {
+                    totalPages: 1,
+                    lastRefreshedDatetime: '2024-01-10T00:00:00Z',
+                    transactionDetails: [txDetail('TX-1', '10.00')],
+                },
+            });
+
+            const report = await createService().searchTransactions(
+                '2024-01-01T00:00:00.000Z',
+                '2024-01-15T00:00:00.000Z',
+            );
+
+            expect(report.totalItems).toBe(1);
+            expect(report.lastRefreshedAt).toBe('2024-01-10T00:00:00Z');
+            expect(report.transactions[0]).toEqual({
+                transactionId: 'TX-1',
+                status: 'S',
+                eventCode: 'T0006',
+                initiationDate: '2024-01-05T10:00:00Z',
+                updatedDate: undefined,
+                currencyCode: 'USD',
+                value: '10.00',
+                feeCurrencyCode: 'USD',
+                feeValue: '-0.50',
+            });
+            expect(searchTransactionsMock).toHaveBeenCalledTimes(1);
+        });
+
+        it('paginates within a window until all pages are fetched', async () => {
+            searchTransactionsMock
+                .mockResolvedValueOnce({ result: { totalPages: 2, transactionDetails: [txDetail('TX-1', '10.00')] } })
+                .mockResolvedValueOnce({ result: { totalPages: 2, transactionDetails: [txDetail('TX-2', '20.00')] } });
+
+            const report = await createService().searchTransactions(
+                '2024-01-01T00:00:00.000Z',
+                '2024-01-10T00:00:00.000Z',
+            );
+
+            expect(report.totalItems).toBe(2);
+            expect(searchTransactionsMock).toHaveBeenCalledTimes(2);
+            expect(searchTransactionsMock.mock.calls[0][0].page).toBe(1);
+            expect(searchTransactionsMock.mock.calls[1][0].page).toBe(2);
+        });
+
+        it('splits a range longer than 31 days into multiple windows', async () => {
+            searchTransactionsMock.mockResolvedValue({
+                result: { totalPages: 1, transactionDetails: [txDetail('TX-W', '5.00')] },
+            });
+
+            const report = await createService().searchTransactions(
+                '2024-01-01T00:00:00.000Z',
+                '2024-02-10T00:00:00.000Z', // 40 days
+            );
+
+            expect(searchTransactionsMock).toHaveBeenCalledTimes(2);
+            expect(searchTransactionsMock.mock.calls[0][0]).toMatchObject({
+                startDate: '2024-01-01T00:00:00.000Z',
+                endDate: '2024-02-01T00:00:00.000Z',
+            });
+            expect(searchTransactionsMock.mock.calls[1][0]).toMatchObject({
+                startDate: '2024-02-01T00:00:00.000Z',
+                endDate: '2024-02-10T00:00:00.000Z',
+            });
+            expect(report.totalItems).toBe(2);
+        });
+
+        it('rejects an invalid date range', async () => {
+            await expect(
+                createService().searchTransactions('2024-02-01T00:00:00Z', '2024-01-01T00:00:00Z'),
+            ).rejects.toThrow(/startDate must be before endDate/);
+            expect(searchTransactionsMock).not.toHaveBeenCalled();
+        });
+
+        it('wraps transaction-search SDK errors with a safe message', async () => {
+            searchTransactionsMock.mockRejectedValue(new Error('rate limited'));
+            await expect(
+                createService().searchTransactions('2024-01-01T00:00:00Z', '2024-01-10T00:00:00Z'),
+            ).rejects.toThrow(/Failed to search transactions: rate limited/);
+        });
+
+        it('maps account balances', async () => {
+            searchBalancesMock.mockResolvedValue({
+                result: {
+                    accountId: 'ACC-1',
+                    asOfTime: '2024-01-10T00:00:00Z',
+                    lastRefreshTime: '2024-01-10T00:00:00Z',
+                    balances: [
+                        {
+                            currency: 'USD',
+                            primary: true,
+                            totalBalance: { currencyCode: 'USD', value: '100.00' },
+                            availableBalance: { currencyCode: 'USD', value: '90.00' },
+                            withheldBalance: { currencyCode: 'USD', value: '10.00' },
+                        },
+                    ],
+                },
+            });
+
+            const report = await createService().getBalances();
+
+            expect(report.accountId).toBe('ACC-1');
+            expect(report.balances[0]).toEqual({
+                currency: 'USD',
+                primary: true,
+                totalCurrencyCode: 'USD',
+                totalValue: '100.00',
+                availableCurrencyCode: 'USD',
+                availableValue: '90.00',
+                withheldCurrencyCode: 'USD',
+                withheldValue: '10.00',
+            });
+        });
+
+        it('passes asOfTime and currencyCode through to the SDK', async () => {
+            searchBalancesMock.mockResolvedValue({ result: { balances: [] } });
+            await createService().getBalances('2024-01-01T00:00:00Z', 'EUR');
+            expect(searchBalancesMock.mock.calls[0][0]).toEqual({
+                asOfTime: '2024-01-01T00:00:00Z',
+                currencyCode: 'EUR',
+            });
         });
     });
 });
