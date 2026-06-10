@@ -34,6 +34,7 @@ import { PayPalSubscriptionService } from './subscription/paypal-subscription.se
 import { payPalSubscriptionSyncTask } from './subscription/paypal-subscription-sync.task';
 import { PayPalReportingAdminResolver } from './reporting/api/paypal-reporting-admin.resolver';
 import { reportingAdminApiExtensions } from './reporting/api/reporting-api-extensions';
+import { PayPalFulfillmentService } from './fulfillment/paypal-fulfillment.service';
 import { PayPalIntent, PayPalPluginOptions } from './types';
 
 /**
@@ -92,6 +93,7 @@ import { PayPalIntent, PayPalPluginOptions } from './types';
     providers: [
         PayPalService,
         PayPalSubscriptionService,
+        PayPalFulfillmentService,
         { provide: PAYPAL_PLUGIN_OPTIONS, useFactory: () => PayPalPlugin.options },
     ],
 })

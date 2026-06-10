@@ -21,6 +21,7 @@ const cancelSubscriptionMock = vi.fn();
 const captureSubscriptionMock = vi.fn();
 const searchTransactionsMock = vi.fn();
 const searchBalancesMock = vi.fn();
+const createOrderTrackingMock = vi.fn();
 
 // Mock the PayPal SDK: keep the real enums/error classes, but replace the
 // network-facing Client and controllers with controllable stubs.
@@ -34,6 +35,7 @@ vi.mock('@paypal/paypal-server-sdk', async importOriginal => {
             captureOrder = captureOrderMock;
             authorizeOrder = authorizeOrderMock;
             getOrder = getOrderMock;
+            createOrderTracking = createOrderTrackingMock;
         },
         PaymentsController: class {
             captureAuthorizedPayment = captureAuthorizedPaymentMock;
@@ -113,6 +115,7 @@ describe('PayPalService', () => {
         captureSubscriptionMock.mockReset();
         searchTransactionsMock.mockReset();
         searchBalancesMock.mockReset();
+        createOrderTrackingMock.mockReset();
     });
 
     describe('createOrder', () => {
@@ -754,6 +757,52 @@ describe('PayPalService', () => {
                 asOfTime: '2024-01-01T00:00:00Z',
                 currencyCode: 'EUR',
             });
+        });
+    });
+
+    describe('addOrderTracking (Use Case 8)', () => {
+        it('uses a known carrier when the method matches a PayPal carrier', async () => {
+            createOrderTrackingMock.mockResolvedValue({ result: { id: 'O-1' } });
+
+            await createService().addOrderTracking('O-1', 'CAP-1', {
+                trackingNumber: 'TRK-1',
+                carrierMethod: 'UPS',
+                notifyPayer: true,
+            });
+
+            expect(createOrderTrackingMock.mock.calls[0][0]).toEqual({
+                id: 'O-1',
+                body: {
+                    captureId: 'CAP-1',
+                    trackingNumber: 'TRK-1',
+                    carrier: 'UPS',
+                    notifyPayer: true,
+                },
+            });
+        });
+
+        it('falls back to OTHER + carrierNameOther for an unknown carrier', async () => {
+            createOrderTrackingMock.mockResolvedValue({ result: { id: 'O-1' } });
+
+            await createService().addOrderTracking('O-1', 'CAP-1', {
+                trackingNumber: 'TRK-2',
+                carrierMethod: 'Standard Shipping',
+            });
+
+            expect(createOrderTrackingMock.mock.calls[0][0].body).toEqual({
+                captureId: 'CAP-1',
+                trackingNumber: 'TRK-2',
+                carrier: 'OTHER',
+                carrierNameOther: 'Standard Shipping',
+                notifyPayer: true,
+            });
+        });
+
+        it('wraps tracking SDK errors with a safe message', async () => {
+            createOrderTrackingMock.mockRejectedValue(new Error('order not found'));
+            await expect(
+                createService().addOrderTracking('O-1', 'CAP-1', { carrierMethod: 'UPS' }),
+            ).rejects.toThrow(/Failed to add tracking to the PayPal order: order not found/);
         });
     });
 });
