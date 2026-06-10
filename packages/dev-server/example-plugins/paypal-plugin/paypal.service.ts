@@ -20,6 +20,7 @@ import {
     PlanRequestStatus,
     Refund,
     SetupFeeFailureAction,
+    ShipmentCarrier,
     Subscription as PayPalSubscriptionResponse,
     SubscriptionsController,
     TenureType,
@@ -747,6 +748,65 @@ export class PayPalService {
         } catch (e) {
             throw this.toError('capture the subscription payment', e);
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Shipment tracking (Use Case 8)
+    // ---------------------------------------------------------------------------
+
+    /**
+     * @description
+     * Attaches shipment tracking (carrier + tracking number) to a captured
+     * PayPal order so the buyer can see it in their PayPal account.
+     *
+     * @param paypalOrderId The PayPal order id (from the settled payment metadata).
+     * @param captureId The PayPal capture id the shipment relates to.
+     * @param options Tracking number, the Vendure shipping method (mapped to a
+     * PayPal carrier), and whether to email the payer.
+     */
+    async addOrderTracking(
+        paypalOrderId: string,
+        captureId: string,
+        options: { trackingNumber?: string; carrierMethod?: string; notifyPayer?: boolean },
+    ): Promise<void> {
+        const { carrier, carrierNameOther } = this.resolveCarrier(options.carrierMethod);
+        try {
+            await this.withRetry('add tracking to the PayPal order', async () => {
+                await this.ordersController.createOrderTracking({
+                    id: paypalOrderId,
+                    body: {
+                        captureId,
+                        trackingNumber: options.trackingNumber || undefined,
+                        carrier,
+                        ...(carrierNameOther ? { carrierNameOther } : {}),
+                        notifyPayer: options.notifyPayer ?? true,
+                    },
+                });
+            });
+        } catch (e) {
+            throw this.toError('add tracking to the PayPal order', e);
+        }
+    }
+
+    /**
+     * Maps a free-text Vendure shipping-method name to a PayPal {@link ShipmentCarrier}.
+     * Falls back to `OTHER` with the original name when no known carrier matches.
+     * Note: the SDK enum omits `OTHER`, but the API accepts it, hence the cast.
+     */
+    private resolveCarrier(method?: string): {
+        carrier: ShipmentCarrier;
+        carrierNameOther?: string;
+    } {
+        const other = 'OTHER' as ShipmentCarrier;
+        const trimmed = method?.trim();
+        if (trimmed) {
+            const candidate = trimmed.toUpperCase().replace(/\s+/g, '_');
+            if ((Object.values(ShipmentCarrier) as string[]).includes(candidate)) {
+                return { carrier: candidate as ShipmentCarrier };
+            }
+            return { carrier: other, carrierNameOther: trimmed };
+        }
+        return { carrier: other, carrierNameOther: 'Other' };
     }
 
     // ---------------------------------------------------------------------------
