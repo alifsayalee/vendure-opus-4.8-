@@ -1,0 +1,90 @@
+1st usecase (STANDARD CHECKOUT): agent tried implementing controllers that are needed for all features 1-8, i asked it to implement only the ones required for 1st feature, and do the rest implementation per feature.
+
+12 minutes 52 seconds -> claude code
+
+CALLBACK issue in paypal due to claude code
+The issue is that the createPayPalOrder call doesn't include returnUrl/cancelUrl redirect URLs, so PayPal doesn't know where to send the buyer after approval and the page spins indefinitely.
+Let me check the exact SDK type for these fields first.
+
+FIX:
+Good — it's exported. Now I have the exact structure. The fix is to add paymentSource.paypal.experienceContext with returnUrl, cancelUrl, and userAction: PAY_NOW to the createOrder call in paypal.service.ts.
+I also need to add two env vars for the return/cancel URLs.
+
+1 minute 59 seconds for fix
+
+MANUAL FIX ADDED: CLAUDE GAVE .ENV WITH PAYPAL URLs:
+PAYPAL_RETURN_URL=http://localhost:8080/checkout/paypal-return
+PAYPAL_CANCEL_URL=http://localhost:8080/checkout/paypal-cancel
+
+however server was using 3000 as port, so the payment checkout page couldn't be reached. manually fixed it to 3000.
+
+TIME TAKEN: 14 MINUTES 51 SECONDS
+-------------------------------------
+2nd usacase (AUTHORIZE-THEN-CAPTURE):
+
+~2 minutes
+2 minutes 37 seconds
+
+2ND USE CASE IMPLEMENTED WITHOUT ERRORS HERE
+
+TIME TAKEN: 4 MINUTES 37 SECONDS
+-------------------------------------
+
+3rd usecase (payment cancellation/void)
+
+TIME TAKEN: 59 SECONDS
+------------------------------------------
+4th usecase (full refund):
+
+WHILE TESTING : ⚠️ Test instructions — missing two required Vendure input fields (shipping: 0, adjustment: 0)
+
+
+TIME TAKEN: 2 minutes 56 seconds
+---------------------------------------------
+
+5th usecase (partial refund)
+
+1 minute 6 seconds
+
+UC5 LOGS ISSUE, SAYS FULL REFUND EVEN WHEN PARTIAL REFUND REQUESTED
+
+24 seconds
+
+TIME TAKEN: 1 MINUTES 30 SECONDS
+-----------------------------------------------
+
+6th usecase (subscription billing (recurring payments))
+
+8 minutes 19 seconds
+
+13 seconds (mariadb doesn't support ID type directly, server exited with code 1, typescript issue)
+
+16 seconds (test accounts needed verification, turned it to false so they don't need it for development)
+
+TIME TAKEN: 8 MINUTES 48 SECONDS
+----------------------------------------------
+
+7th usecase (transaction reporting)
+
+3 minutes 13 seconds
+
+TIME TAKEN: 3 MINUTES 13 SECONDS
+-----------------------------------------------
+
+8th usecase (order shipment tracking)
+
+2 minutes 47 seconds
+
+1 minute 57 seconds (cancelling shipment tracking was returning an empty error message, added logging to see what paypal was returning, also checking if trackerId format was correct for cancel call)
+
+TIME TAKEN: 5 MINUTES 44 SECONDS
+
+Total cost:            $10.07
+   Total duration (API):  34m 15s
+   Total duration (wall): 8h 55m 57s
+ Total code changes:    1761 lines added, 154 lines removed
+ Usage by model:
+     claude-haiku-4-5:  62.5k input, 6.8k output, 0 cache read, 0 cache write ($0.0963)                             
+	 claude-sonnet-4-6:  7.1k input, 106.7k output, 22.8m cache read, 401.3k cache write ($9.97) 
+	 
+
