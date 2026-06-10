@@ -7,6 +7,7 @@ const getOrderMock = vi.fn();
 const captureAuthorizedPaymentMock = vi.fn();
 const getAuthorizedPaymentMock = vi.fn();
 const voidPaymentMock = vi.fn();
+const refundCapturedPaymentMock = vi.fn();
 
 // Mock the PayPal SDK: keep the real enums/error classes, but replace the
 // network-facing Client and controllers with controllable stubs.
@@ -25,6 +26,7 @@ vi.mock('@paypal/paypal-server-sdk', async importOriginal => {
             captureAuthorizedPayment = captureAuthorizedPaymentMock;
             getAuthorizedPayment = getAuthorizedPaymentMock;
             voidPayment = voidPaymentMock;
+            refundCapturedPayment = refundCapturedPaymentMock;
         },
     };
 });
@@ -67,6 +69,7 @@ describe('PayPalService', () => {
         captureAuthorizedPaymentMock.mockReset();
         getAuthorizedPaymentMock.mockReset();
         voidPaymentMock.mockReset();
+        refundCapturedPaymentMock.mockReset();
     });
 
     describe('createOrder', () => {
@@ -320,6 +323,53 @@ describe('PayPalService', () => {
             voidPaymentMock.mockRejectedValue(new Error('already captured'));
             await expect(createService().voidAuthorization('AUTH-1')).rejects.toThrow(
                 /Failed to void the authorized PayPal payment: already captured/,
+            );
+        });
+    });
+
+    describe('refundCapture (full refund)', () => {
+        it('issues a full refund with no amount body and a full idempotency key', async () => {
+            refundCapturedPaymentMock.mockResolvedValue({
+                result: { id: 'REFUND-1', status: 'COMPLETED', amount: { currencyCode: 'USD', value: '10.00' } },
+            });
+
+            const result = await createService().refundCapture('CAPTURE-1');
+
+            expect(result).toEqual({
+                refundId: 'REFUND-1',
+                status: 'COMPLETED',
+                currencyCode: 'USD',
+                value: '10.00',
+            });
+            const passed = refundCapturedPaymentMock.mock.calls[0][0];
+            expect(passed.captureId).toBe('CAPTURE-1');
+            expect(passed.body).toBeUndefined(); // full refund => no amount
+            expect(passed.paypalRequestId).toBe('refund-CAPTURE-1-full');
+        });
+
+        it('sends the amount and an amount-specific key for a partial refund', async () => {
+            refundCapturedPaymentMock.mockResolvedValue({
+                result: { id: 'REFUND-2', status: 'COMPLETED', amount: { currencyCode: 'USD', value: '4.00' } },
+            });
+
+            await createService().refundCapture('CAPTURE-1', { amountMinorUnits: 400, currencyCode: 'USD' });
+
+            const passed = refundCapturedPaymentMock.mock.calls[0][0];
+            expect(passed.body).toEqual({ amount: { currencyCode: 'USD', value: '4.00' } });
+            expect(passed.paypalRequestId).toBe('refund-CAPTURE-1-400');
+        });
+
+        it('throws when the refund response contains no refund', async () => {
+            refundCapturedPaymentMock.mockResolvedValue({ result: {} });
+            await expect(createService().refundCapture('CAPTURE-1')).rejects.toThrow(
+                /did not contain a refund/,
+            );
+        });
+
+        it('wraps SDK errors with a safe message', async () => {
+            refundCapturedPaymentMock.mockRejectedValue(new Error('refund boom'));
+            await expect(createService().refundCapture('CAPTURE-1')).rejects.toThrow(
+                /Failed to refund the captured PayPal payment: refund boom/,
             );
         });
     });

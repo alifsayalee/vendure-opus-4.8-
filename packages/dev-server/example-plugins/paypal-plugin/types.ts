@@ -118,6 +118,21 @@ export interface CaptureAuthorizationResult {
 
 /**
  * @description
+ * The result of refunding a captured PayPal payment (Use Cases 4 & 5).
+ */
+export interface RefundCaptureResult {
+    /** The PayPal-generated refund id. */
+    refundId: string;
+    /** The refund status (`COMPLETED`, `PENDING`, `FAILED`, `CANCELLED`). */
+    status: string;
+    /** The refunded currency code, as reported by PayPal. */
+    currencyCode?: string;
+    /** The refunded amount as a decimal string, as reported by PayPal. */
+    value?: string;
+}
+
+/**
+ * @description
  * The result of voiding (cancelling) an authorized but uncaptured PayPal
  * payment (Use Case 3).
  */

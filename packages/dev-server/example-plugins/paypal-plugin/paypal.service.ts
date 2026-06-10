@@ -12,6 +12,7 @@ import {
     OrderAuthorizeResponse,
     OrdersController,
     PaymentsController,
+    Refund,
 } from '@paypal/paypal-server-sdk';
 
 import { loggerCtx, PAYPAL_PLUGIN_OPTIONS } from './constants';
@@ -22,6 +23,7 @@ import {
     CreatePayPalOrderResult,
     PayPalIntent,
     PayPalPluginOptions,
+    RefundCaptureResult,
     VoidAuthorizationResult,
 } from './types';
 
@@ -327,6 +329,65 @@ export class PayPalService {
         return {
             authorizationId,
             status: result?.status ?? 'VOIDED',
+        };
+    }
+
+    /**
+     * @description
+     * Refunds a captured PayPal payment (Use Cases 4 & 5). When `amountMinorUnits`
+     * is omitted the entire captured amount is refunded (full refund); when
+     * provided, that specific amount is refunded (partial refund).
+     *
+     * @param captureId The PayPal capture id stored on the settled payment.
+     * @param options Optional partial-refund amount and its currency code.
+     */
+    async refundCapture(
+        captureId: string,
+        options?: { amountMinorUnits: number; currencyCode: string },
+    ): Promise<RefundCaptureResult> {
+        let result: Refund;
+        try {
+            result = await this.withRetry('refund the captured PayPal payment', async () => {
+                const body =
+                    options !== undefined
+                        ? {
+                              amount: {
+                                  currencyCode: options.currencyCode,
+                                  value: this.toPayPalValue(
+                                      options.amountMinorUnits,
+                                      options.currencyCode,
+                                  ),
+                              },
+                          }
+                        : undefined;
+                return (
+                    await this.paymentsController.refundCapturedPayment({
+                        captureId,
+                        prefer: 'return=representation',
+                        // Idempotency key: a retried refund returns the original
+                        // refund instead of refunding the buyer twice. The key is
+                        // specific to the amount so distinct partial refunds are
+                        // treated as separate operations.
+                        paypalRequestId: options
+                            ? `refund-${captureId}-${options.amountMinorUnits}`
+                            : `refund-${captureId}-full`,
+                        body,
+                    })
+                ).result;
+            });
+        } catch (e) {
+            throw this.toError('refund the captured PayPal payment', e);
+        }
+
+        if (!result?.id || !result.status) {
+            throw new Error('PayPal refund response did not contain a refund');
+        }
+
+        return {
+            refundId: result.id,
+            status: result.status,
+            currencyCode: result.amount?.currencyCode,
+            value: result.amount?.value,
         };
     }
 
