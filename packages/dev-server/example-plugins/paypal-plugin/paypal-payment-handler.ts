@@ -185,24 +185,26 @@ export const payPalPaymentHandler = new PaymentMethodHandler({
             return { state: 'Failed' as const, metadata: { errorMessage: 'Missing captureId in payment metadata' } };
         }
 
-        // Use Case 4 handles FULL refunds only (the entire captured amount).
-        // Partial refunds (a smaller amount) are implemented in Use Case 5.
-        if (amount < payment.amount) {
-            Logger.warn(
-                `Partial refund of ${amount} requested for payment ${payment.id} (amount ${payment.amount}); ` +
-                    'partial refunds are not yet supported',
-                loggerCtx,
-            );
-            return {
-                state: 'Failed' as const,
-                metadata: { errorMessage: 'Partial refunds are not yet supported' },
-            };
-        }
+        // The idempotency key must be stable across internal retries of this same
+        // refund, but unique across distinct refunds of the same capture so that
+        // multiple partial refunds (Use Case 5) — even of the same amount — are
+        // each processed by PayPal rather than deduplicated. The count of refunds
+        // already recorded against this payment provides exactly that sequence.
+        const priorRefundCount = payment.refunds?.length ?? 0;
+        const idempotencyKey = `refund-${captureId}-${priorRefundCount}`;
+
+        // A full refund (the entire captured amount) is sent with no amount body;
+        // a partial refund (Use Case 5) sends the specific amount and currency.
+        const isPartial = amount < payment.amount;
+        const partial = isPartial
+            ? { amountMinorUnits: amount, currencyCode: order.currencyCode }
+            : undefined;
 
         try {
-            const refund = await payPalService.refundCapture(captureId);
+            const refund = await payPalService.refundCapture(captureId, idempotencyKey, partial);
             Logger.info(
-                `Refunded PayPal capture ${captureId} for order ${order.code} (refund ${refund.refundId}, status ${refund.status})`,
+                `${isPartial ? 'Partially refunded' : 'Refunded'} PayPal capture ${captureId} for order ` +
+                    `${order.code} (refund ${refund.refundId}, status ${refund.status})`,
                 loggerCtx,
             );
             return {
