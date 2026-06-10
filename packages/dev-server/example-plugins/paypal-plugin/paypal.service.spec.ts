@@ -327,13 +327,13 @@ describe('PayPalService', () => {
         });
     });
 
-    describe('refundCapture (full refund)', () => {
-        it('issues a full refund with no amount body and a full idempotency key', async () => {
+    describe('refundCapture', () => {
+        it('issues a full refund with no amount body and the given idempotency key', async () => {
             refundCapturedPaymentMock.mockResolvedValue({
                 result: { id: 'REFUND-1', status: 'COMPLETED', amount: { currencyCode: 'USD', value: '10.00' } },
             });
 
-            const result = await createService().refundCapture('CAPTURE-1');
+            const result = await createService().refundCapture('CAPTURE-1', 'refund-CAPTURE-1-0');
 
             expect(result).toEqual({
                 refundId: 'REFUND-1',
@@ -344,31 +344,34 @@ describe('PayPalService', () => {
             const passed = refundCapturedPaymentMock.mock.calls[0][0];
             expect(passed.captureId).toBe('CAPTURE-1');
             expect(passed.body).toBeUndefined(); // full refund => no amount
-            expect(passed.paypalRequestId).toBe('refund-CAPTURE-1-full');
+            expect(passed.paypalRequestId).toBe('refund-CAPTURE-1-0');
         });
 
-        it('sends the amount and an amount-specific key for a partial refund', async () => {
+        it('sends the amount for a partial refund and forwards the idempotency key', async () => {
             refundCapturedPaymentMock.mockResolvedValue({
                 result: { id: 'REFUND-2', status: 'COMPLETED', amount: { currencyCode: 'USD', value: '4.00' } },
             });
 
-            await createService().refundCapture('CAPTURE-1', { amountMinorUnits: 400, currencyCode: 'USD' });
+            await createService().refundCapture('CAPTURE-1', 'refund-CAPTURE-1-1', {
+                amountMinorUnits: 400,
+                currencyCode: 'USD',
+            });
 
             const passed = refundCapturedPaymentMock.mock.calls[0][0];
             expect(passed.body).toEqual({ amount: { currencyCode: 'USD', value: '4.00' } });
-            expect(passed.paypalRequestId).toBe('refund-CAPTURE-1-400');
+            expect(passed.paypalRequestId).toBe('refund-CAPTURE-1-1');
         });
 
         it('throws when the refund response contains no refund', async () => {
             refundCapturedPaymentMock.mockResolvedValue({ result: {} });
-            await expect(createService().refundCapture('CAPTURE-1')).rejects.toThrow(
+            await expect(createService().refundCapture('CAPTURE-1', 'k')).rejects.toThrow(
                 /did not contain a refund/,
             );
         });
 
         it('wraps SDK errors with a safe message', async () => {
             refundCapturedPaymentMock.mockRejectedValue(new Error('refund boom'));
-            await expect(createService().refundCapture('CAPTURE-1')).rejects.toThrow(
+            await expect(createService().refundCapture('CAPTURE-1', 'k')).rejects.toThrow(
                 /Failed to refund the captured PayPal payment: refund boom/,
             );
         });
